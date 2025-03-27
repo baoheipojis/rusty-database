@@ -1,0 +1,30 @@
+# 忽略 Cargo 的编译输出
+/target/
+
+# 忽略 Cargo.lock 文件（如果是库项目）
+# 如果是二进制项目，通常需要提交 Cargo.lock
+/Cargo.lock
+
+# 忽略编译时生成的临时文件
+**/*.rs.bk
+
+# 忽略 IDE 和编辑器的临时文件
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains 系列（如 CLion、IntelliJ IDEA）
+.idea/
+
+# macOS 系统文件
+.DS_Store
+
+# 忽略调试工具生成的文件
+*.log
+*.tmp
+
+# 忽略覆盖率工具生成的文件
+/coverage/
+
+# 忽略测试生成的临时文件
+/tests/output/
