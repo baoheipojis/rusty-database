@@ -1,4 +1,6 @@
 // Filename: mod.rs
+extern crate sqlparser;
+
 // mod.rs是模块的入口文件
 pub mod handler;
 pub mod formatter;
@@ -18,3 +20,6 @@ pub fn execute_ast(ast: Vec<sqlparser::ast::Statement>, storage_engine: &mut dyn
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

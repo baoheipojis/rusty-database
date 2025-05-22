@@ -1,7 +1,6 @@
-[package]
-name = "rusty-database"  # 项目名称
-version = "0.1.0"        # 项目版本
-edition = "2021"         # Rust 版本 (推荐使用 2021)
-
-[dependencies]
-sqlparser = "0.13"       # 示例依赖，根据实际需要添加
+[workspace]
+members = [
+    "executor",
+    "parser",
+    "storage"
+]
