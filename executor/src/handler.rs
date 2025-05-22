@@ -357,4 +357,113 @@ mod tests {
             _ => panic!("Unexpected query result type for CREATE TABLE"),
         }
     }
+
+    #[test]
+    fn test_extract_condition_less_than() {
+        let sql = "SELECT id FROM test_table WHERE age < 25";
+        let statement = parse_sql_to_statement(sql);
+        match statement {
+            Statement::Query(query) => {
+                let condition = extract_condition_from_select(&query.body).unwrap();
+                match condition {
+                    Some(Condition::LessThan(col, val)) => {
+                        assert_eq!(col, "age");
+                        assert_eq!(val, Value::Int(25));
+                    }
+                    _ => panic!("Expected LessThan condition"),
+                }
+            }
+            _ => panic!("Expected Query statement"),
+        }
+    }
+
+    #[test]
+    fn test_extract_condition_equals_varchar() {
+        let sql = "SELECT id FROM test_table WHERE name = 'Alice'";
+        let statement = parse_sql_to_statement(sql);
+        match statement {
+            Statement::Query(query) => {
+                let condition = extract_condition_from_select(&query.body).unwrap();
+                match condition {
+                    Some(Condition::Equals(col, val)) => {
+                        assert_eq!(col, "name");
+                        assert_eq!(val, Value::Varchar("Alice".to_string()));
+                    }
+                    _ => panic!("Expected Equals condition with Varchar"),
+                }
+            }
+            _ => panic!("Expected Query statement"),
+        }
+    }
+
+    #[test]
+    fn test_extract_condition_no_where() {
+        let sql = "SELECT id FROM test_table";
+        let statement = parse_sql_to_statement(sql);
+        match statement {
+            Statement::Query(query) => {
+                let condition = extract_condition_from_select(&query.body).unwrap();
+                assert!(condition.is_none(), "Expected no condition");
+            }
+            _ => panic!("Expected Query statement"),
+        }
+    }
+
+    #[test]
+    fn test_execute_insert_multiple_rows() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        let table_name = "multi_insert_table";
+        let schema = Schema {
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: StorageDataType::Int(32), constraints: vec![] },
+                ColumnDefinition { name: "item".to_string(), data_type: StorageDataType::Varchar(50), constraints: vec![] },
+            ]
+        };
+        mock_storage.create_table(table_name, schema.clone()).unwrap();
+
+        let sql = "INSERT INTO multi_insert_table (id, item) VALUES (1, 'Apple'), (2, 'Banana'), (3, 'Cherry')";
+        let statement = parse_sql_to_statement(sql);
+
+        match execute_ast(statement, &mut mock_storage) {
+            Ok(QueryResult::Success) => {
+                let selected_rows = mock_storage.select_rows(table_name, vec!["id".to_string(), "item".to_string()], None).unwrap();
+                assert_eq!(selected_rows.len(), 3);
+                assert_eq!(selected_rows[0].values[0], Value::Int(1));
+                assert_eq!(selected_rows[0].values[1], Value::Varchar("Apple".to_string()));
+                assert_eq!(selected_rows[1].values[0], Value::Int(2));
+                assert_eq!(selected_rows[1].values[1], Value::Varchar("Banana".to_string()));
+                assert_eq!(selected_rows[2].values[0], Value::Int(3));
+                assert_eq!(selected_rows[2].values[1], Value::Varchar("Cherry".to_string()));
+            }
+            Err(e) => panic!("Execution failed: {:?}", e),
+            _ => panic!("Unexpected query result type for INSERT"),
+        }
+    }
+
+    #[test]
+    fn test_execute_insert_null_value() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        let table_name = "null_test_table";
+        let schema = Schema {
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: StorageDataType::Int(32), constraints: vec![] },
+                ColumnDefinition { name: "description".to_string(), data_type: StorageDataType::Varchar(255), constraints: vec![] },
+            ]
+        };
+        mock_storage.create_table(table_name, schema.clone()).unwrap();
+
+        let sql = "INSERT INTO null_test_table (id, description) VALUES (1, NULL)";
+        let statement = parse_sql_to_statement(sql);
+
+        match execute_ast(statement, &mut mock_storage) {
+            Ok(QueryResult::Success) => {
+                let selected_rows = mock_storage.select_rows(table_name, vec!["id".to_string(), "description".to_string()], None).unwrap();
+                assert_eq!(selected_rows.len(), 1);
+                assert_eq!(selected_rows[0].values[0], Value::Int(1));
+                assert_eq!(selected_rows[0].values[1], Value::Null);
+            }
+            Err(e) => panic!("Execution failed: {:?}", e),
+            _ => panic!("Unexpected query result type for INSERT"),
+        }
+    }
 }

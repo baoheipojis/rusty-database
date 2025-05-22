@@ -8,5 +8,4 @@ pub mod utils;
 pub use handler::*;
 pub use error::*;
 
-#[cfg(test)]
-mod tests;
+
