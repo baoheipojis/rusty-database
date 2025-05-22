@@ -1,10 +1,28 @@
 // bplus_tree.rs
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BPlusTreeNode {
     is_leaf: bool,                     // 节点是否为叶子节点
     keys: Vec<i32>,                   // 节点中的关键字
     children: Vec<Box<BPlusTreeNode>>, // 孩子节点的引用
+}
+
+impl BPlusTreeNode {
+    fn new_leaf() -> Self {
+        BPlusTreeNode {
+            is_leaf: true,
+            keys: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    fn new_internal() -> Self {
+        BPlusTreeNode {
+            is_leaf: false,
+            keys: Vec::new(),
+            children: Vec::new(),
+        }
+    }
 }
 
 pub struct BPlusTree {
@@ -17,11 +35,7 @@ impl BPlusTree {
     /// 参数: degree - 树的阶（最小度数）
     pub fn new(degree: usize) -> Self {
         Self {
-            root: Box::new(BPlusTreeNode {
-                is_leaf: true,       // 初始时根节点为叶子节点
-                keys: Vec::new(),    // 关键字初始为空
-                children: Vec::new(), // 孩子节点初始为空
-            }),
+            root: Box::new(BPlusTreeNode::new_leaf()), // Root starts as a leaf
             degree,
         }
     }
@@ -29,50 +43,87 @@ impl BPlusTree {
     /// 插入关键字
     /// 参数: key - 要插入的关键字
     pub fn insert(&mut self, key: i32) {
-        let root = &mut *self.root;
-
-        // 如果根节点已满，则树高度增加
-        if root.keys.len() == (2 * self.degree) - 1 {
-            // 创建新的根节点
-            let new_root = Box::new(BPlusTreeNode {
-                is_leaf: false,
-                keys: Vec::new(),
-                children: vec![self.root.clone()],
-            });
-            self.root = new_root; // 更新根节点
-            self.split_child(&mut self.root, 0); // 分裂根节点
-            self.insert_non_full(&mut self.root, key); // 在新根节点中插入
-        } else {
-            self.insert_non_full(root, key); // 在非满节点中插入
+        let degree = self.degree;
+        
+        if self.root.keys.len() == (2 * degree) - 1 { // Root is full
+            // old_root_box now owns the previous root tree.
+            let old_root_box = std::mem::replace(&mut self.root, Box::new(BPlusTreeNode::new_internal())); 
+            
+            // self.root is now a new, empty internal node.
+            // Make old_root_box its first child.
+            self.root.children.push(old_root_box);
+            
+            // Now, self.root is the parent, and its child at index 0 is the (full) old root.
+            // Split this child.
+            Self::split_child_node(degree, &mut *self.root, 0);
+            
+            // After split, self.root has one key and two children.
+            // Insert the key into this (no longer empty, not full) new root structure.
+            Self::insert_non_full_node(degree, &mut *self.root, key);
+        } else { // Root is not full
+            Self::insert_non_full_node(degree, &mut *self.root, key);
         }
     }
 
-    /// 在非满节点中插入关键字
-    /// 参数: node - 当前节点, key - 要插入的关键字
-    fn insert_non_full(&mut self, node: &mut BPlusTreeNode, key: i32) {
+    /// 在非满节点中插入关键字 (static helper)
+    /// 参数: degree - 树的阶, node - 当前节点, key - 要插入的关键字
+    fn insert_non_full_node(degree: usize, node: &mut BPlusTreeNode, key: i32) {
         if node.is_leaf {
-            // 在叶节点中插入关键字
             let pos = node.keys.iter().position(|&k| k > key).unwrap_or(node.keys.len());
-            node.keys.insert(pos, key); // 按顺序插入关键字
-        } else {
-            // 在非叶子节点中查找孩子节点
-            let pos = node.keys.iter().position(|&k| k > key).unwrap_or(node.keys.len());
-            self.insert_non_full(&mut node.children[pos], key); // 递归插入
+            node.keys.insert(pos, key);
+        } else { // node is internal
+            let mut insertion_point_idx = node.keys.iter().position(|&k| k > key).unwrap_or(node.keys.len());
+            
+            // Check if the child we are about to descend into is full
+            if node.children[insertion_point_idx].keys.len() == (2 * degree) - 1 {
+                Self::split_child_node(degree, node, insertion_point_idx);
+                
+                // After split, the key `key` might go to the child at `insertion_point_idx` or `insertion_point_idx + 1`.
+                // `node.keys[insertion_point_idx]` is the key that was promoted from the split child.
+                if key > node.keys[insertion_point_idx] {
+                    insertion_point_idx += 1; 
+                }
+            }
+            // Now, child at node.children[insertion_point_idx] is guaranteed not full.
+            Self::insert_non_full_node(degree, &mut node.children[insertion_point_idx], key);
         }
     }
 
-    /// 分裂子节点，并在父节点中插入提升的关键字
-    /// 参数: parent - 父节点, index - 子节点的索引
-    fn split_child(&mut self, parent: &mut BPlusTreeNode, index: usize) {
-        let child = &mut parent.children[index]; // 获取要分裂的子节点
-        let new_node = Box::new(BPlusTreeNode {
-            is_leaf: child.is_leaf, // 新节点是否为叶子节点
-            keys: child.keys.split_off(self.degree - 1), // 分裂关键字
-            children: if child.is_leaf { vec![] } else { child.children.split_off(self.degree) }, // 分裂孩子节点
-        });
+    /// 分裂子节点 (static helper)
+    /// 参数: degree - 树的阶, parent_node - 父节点, child_index - 子节点的索引
+    fn split_child_node(degree: usize, parent_node: &mut BPlusTreeNode, child_index: usize) {
+        let mut new_sibling_node_content = BPlusTreeNode {
+            is_leaf: parent_node.children[child_index].is_leaf,
+            keys: Vec::new(),
+            children: Vec::new(),
+        };
 
-        parent.keys.insert(index, child.keys.pop().unwrap()); // 提升关键字到父节点
-        parent.children.insert(index + 1, new_node); // 添加新创建的子节点
+        let median_key;
+
+        // Scoped borrow for child_to_split_node
+        {
+            let child_to_split_node = &mut parent_node.children[child_index]; // &mut Box<BPlusTreeNode>
+            
+            // Median key is at index `degree - 1`
+            median_key = child_to_split_node.keys[degree - 1];
+
+            // Move keys from `degree` onwards to new_sibling_node_content
+            new_sibling_node_content.keys = child_to_split_node.keys.drain(degree..).collect();
+            
+            // Remove the median key from child_to_split_node's keys (it's already copied)
+            // and keep keys 0 to degree-2
+            child_to_split_node.keys.truncate(degree - 1);
+
+            if !child_to_split_node.is_leaf {
+                // Move children from `degree` onwards to new_sibling_node_content
+                new_sibling_node_content.children = child_to_split_node.children.drain(degree..).collect();
+                // Keep children 0 to degree-1
+                child_to_split_node.children.truncate(degree);
+            }
+        } // child_to_split_node borrow ends
+
+        parent_node.keys.insert(child_index, median_key);
+        parent_node.children.insert(child_index + 1, Box::new(new_sibling_node_content));
     }
 
     /// 在树中查找关键字

@@ -1,139 +1,360 @@
-use crate::storage::StorageEngine; // 引入存储引擎，crate表示根模块
-use sqlparser::ast::{Query, Statement, SelectItem, Expr}; // 引入 SQL AST 类型
-use crate::executor::error::ExecutionError; // 引入错误定义
-use crate::storage::storage_engine_interface::Row;
+use storage::storage_engine_interface::{StorageEngine, Row, Value, Condition, Schema, ColumnDefinition, DataType as StorageDataType}; // Renamed DataType to avoid conflict
+use sqlparser::ast::{Statement, Query, SetExpr, SelectItem, Expr, TableFactor, Ident, ObjectName, BinaryOperator, DataType as SQLDataType}; // Renamed DataType, removed unused Values
+use crate::error::ExecutionError;
 
-/// 处理 SELECT 查询
-pub fn handle_query(query: Box<Query>, storage_engine: &mut dyn StorageEngine) -> Result<(), ExecutionError> {
-    // 提取目标表和列
-    let table_name = extract_table_name(&query.body)?;
-    let columns = extract_columns(&query.projection);
-    let condition = extract_condition(&query.selection);
+// Represents the result of a query execution
+#[derive(Debug)]
+pub enum QueryResult {
+    Data(Vec<Row>),
+    RowsAffected(u64),
+    Success, // For statements like CREATE TABLE, INSERT without returning data
+}
 
-    // 调用存储引擎的 select_rows 方法
-    let rows = storage_engine.select_rows(table_name, columns, condition)
-        .map_err(|e| ExecutionError::StorageError(e.to_string()))?;
-
-    // 输出查询结果
-    if rows.is_empty() {
-        println!("No results found.");
-    } else {
-        format_and_print_results(rows);
+pub fn execute_ast(statement: Statement, storage_engine: &mut dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
+    match statement {
+        Statement::Query(query) => {
+            let rows = handle_query(&query, storage_engine)?; // Pass Box<Query> by reference
+            Ok(QueryResult::Data(rows))
+        }
+        Statement::Insert { table_name, columns, source, .. } => {
+            handle_insert(&table_name, &columns, &source, storage_engine)?; // Pass Box<Query> by reference
+            Ok(QueryResult::Success)
+        }
+        Statement::CreateTable { name, columns: ast_columns, .. } => {
+            let table_name_str = name.0.get(0).ok_or(ExecutionError::SyntaxError)?.value.clone();
+            let mut schema_columns = Vec::new();
+            for col_def in ast_columns {
+                let column_name = col_def.name.value.clone();
+                let data_type = match col_def.data_type {
+                    SQLDataType::Int(_) => StorageDataType::Int(32),
+                    SQLDataType::Varchar(_) => StorageDataType::Varchar(255),
+                    SQLDataType::SmallInt(_) => StorageDataType::Int(16),
+                    SQLDataType::BigInt(_) => StorageDataType::Int(64),
+                    SQLDataType::Char(_) => StorageDataType::Varchar(255), // Map Char to Varchar
+                    SQLDataType::Decimal(_, _) => StorageDataType::Varchar(255), // Map Decimal to Varchar for simplicity
+                    SQLDataType::Float(_) => StorageDataType::Varchar(255), // Map Float to Varchar for simplicity
+                    SQLDataType::Real => StorageDataType::Varchar(255), // Map Real to Varchar for simplicity
+                    SQLDataType::Double => StorageDataType::Varchar(255), // Map Double to Varchar for simplicity
+                    SQLDataType::Boolean => StorageDataType::Varchar(5), // Map Boolean to Varchar("true"/"false")
+                    SQLDataType::Date => StorageDataType::Varchar(10), // Map Date to Varchar (YYYY-MM-DD)
+                    SQLDataType::Time => StorageDataType::Varchar(8), // Corrected: Time variant without arguments
+                    SQLDataType::Timestamp => StorageDataType::Varchar(29), // Corrected: Timestamp variant without arguments
+                    // Add other specific sqlparser DataType variants as they are used or needed
+                    _ => return Err(ExecutionError::UnsupportedStatement), // Catch-all for unhandled types
+                };
+                schema_columns.push(ColumnDefinition {
+                    name: column_name,
+                    data_type,
+                    constraints: Vec::new(), // TODO: Parse constraints
+                });
+            }
+            let schema = Schema { columns: schema_columns };
+            storage_engine.create_table(&table_name_str, schema)
+                .map_err(ExecutionError::StorageError)?;
+            Ok(QueryResult::Success)
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
     }
-    // OK(())表示返回一个空的Result对象
+}
+
+fn handle_query(query: &Query, storage_engine: &dyn StorageEngine) -> Result<Vec<Row>, ExecutionError> {
+    // Dereference Box<SetExpr> to get &SetExpr for helper functions
+    let query_body_ref: &SetExpr = &query.body;
+    let table_name = extract_table_name(query_body_ref)?;
+    let columns = extract_columns_from_select(query_body_ref)?;
+    let condition = extract_condition_from_select(query_body_ref)?;
+
+    storage_engine.select_rows(&table_name, columns, condition)
+        .map_err(ExecutionError::StorageError)
+}
+
+// Removed unused columns_idents parameter
+fn handle_insert(table_name_obj: &ObjectName, _columns_idents: &[Ident], source_query: &Query, storage_engine: &mut dyn StorageEngine) -> Result<(), ExecutionError> {
+    let table_name_str = table_name_obj.0.get(0).ok_or(ExecutionError::SyntaxError)?.value.clone();
+
+    // Dereference Box<SetExpr> to get &SetExpr for helper functions
+    let source_body_ref: &SetExpr = &source_query.body;
+    let rows_to_insert = extract_insert_values(source_body_ref)?; // Pass &SetExpr
+
+    for row in rows_to_insert {
+        storage_engine.insert_row(&table_name_str, row)
+            .map_err(ExecutionError::StorageError)?;
+    }
     Ok(())
 }
 
-/// 处理 INSERT 操作
-pub fn handle_insert(statement: Statement, storage_engine: &mut dyn StorageEngine) -> Result<(), ExecutionError> {
-    if let Statement::Insert { table_name, columns, source } = statement {
-        // 提取插入的数据
-        let rows = extract_insert_values(source)?;
-
-        // 调用存储引擎的 insert_rows 方法
-        storage_engine.insert_rows(&table_name.to_string(), &columns, rows)
-            .map_err(|e| ExecutionError::StorageError(e.to_string()))?;
-
-        println!("Insert successful!");
-        Ok(())
-    } else {
-        Err(ExecutionError::UnsupportedStatement)
-    }
-}
-
-/// 提取表名 (示例工具函数)
-fn extract_table_name(body: &Query) -> Result<String, ExecutionError> {
-    match body {
-        Query::Select(select) => {
-            if let Some(table) = select.from.iter().next() {
-                Ok(table.to_string())
+fn extract_table_name(query_body: &SetExpr) -> Result<String, ExecutionError> {
+    match query_body {
+        SetExpr::Select(select_expr) => {
+            if let Some(from_clause) = select_expr.from.get(0) {
+                match &from_clause.relation {
+                    TableFactor::Table { name, .. } => {
+                        if let Some(ident) = name.0.get(0) {
+                            Ok(ident.value.clone())
+                        } else {
+                            Err(ExecutionError::SyntaxError)
+                        }
+                    }
+                    _ => Err(ExecutionError::UnsupportedStatement),
+                }
             } else {
-                Err(ExecutionError::SyntaxError)
+                Err(ExecutionError::SyntaxError) // No FROM clause
             }
         }
         _ => Err(ExecutionError::UnsupportedStatement),
     }
 }
 
-/// 提取列名 (示例工具函数)
-fn extract_columns(projection: &[SelectItem]) -> Vec<String> {
-    projection.iter().map(|item| match item {
-        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident.to_string(),
-        _ => "Unknown".to_string(),
-    }).collect()
+fn extract_columns_from_select(query_body: &SetExpr) -> Result<Vec<String>, ExecutionError> {
+    match query_body {
+        SetExpr::Select(select_expr) => {
+            Ok(select_expr.projection.iter().map(|item| {
+                match item {
+                    SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident.value.clone(),
+                    SelectItem::Wildcard => "*".to_string(),
+                    // TODO: Handle AliasedExpr, QualifiedWildcard, etc.
+                    _ => unimplemented!("Unsupported select item for column extraction"),
+                }
+            }).collect())
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
+    }
 }
 
-/// 提取 WHERE 条件 (示例工具函数)
-fn extract_condition(_selection: &Option<Box<sqlparser::ast::Expr>>) -> Option<crate::storage::storage_engine_interface::Condition> {
-    // 这里只做简单示例，实际应解析 SQL AST
-    None
+fn extract_condition_from_select(query_body: &SetExpr) -> Result<Option<Condition>, ExecutionError> {
+    match query_body {
+        SetExpr::Select(select_expr) => {
+            match &select_expr.selection {
+                Some(expr) => {
+                    match expr {
+                        Expr::BinaryOp { left, op, right } => {
+                            let left_col = match left.as_ref() {
+                                Expr::Identifier(ident) => ident.value.clone(),
+                                _ => return Err(ExecutionError::UnsupportedStatement),
+                            };
+
+                            let value_expr = match right.as_ref() {
+                                Expr::Value(v) => v,
+                                _ => return Err(ExecutionError::UnsupportedStatement), // Only support direct value comparison for now
+                            };
+
+                            let parsed_value = match value_expr {
+                                sqlparser::ast::Value::Number(s, _l) => {
+                                    s.parse::<i32>().map(Value::Int).map_err(|_| ExecutionError::SyntaxError)?
+                                },
+                                sqlparser::ast::Value::SingleQuotedString(s) => Value::Varchar(s.clone()),
+                                sqlparser::ast::Value::Boolean(b) => Value::Varchar(b.to_string()),
+                                // TODO: Handle other sqlparser::ast::Value variants
+                                _ => return Err(ExecutionError::UnsupportedStatement),
+                            };
+
+                            match op {
+                                BinaryOperator::Eq => Ok(Some(Condition::Equals(left_col, parsed_value))),
+                                BinaryOperator::Gt => Ok(Some(Condition::GreaterThan(left_col, parsed_value))),
+                                BinaryOperator::Lt => Ok(Some(Condition::LessThan(left_col, parsed_value))),
+                                // TODO: Handle other operators like Ne, GtEq, LtEq, And, Or
+                                _ => Err(ExecutionError::UnsupportedStatement),
+                            }
+                        }
+                        // TODO: Handle other condition expressions
+                        _ => Ok(None), // No condition or unsupported condition type
+                    }
+                }
+                None => Ok(None), // No WHERE clause
+            }
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
+    }
 }
 
-/// 提取插入的值 (示例工具函数)
-fn extract_insert_values(_source: sqlparser::ast::Query) -> Result<Vec<crate::storage::storage_engine_interface::Row>, ExecutionError> {
-    // 这里只做简单示例，实际应解析 SQL AST
-    Ok(vec![crate::storage::storage_engine_interface::Row { values: vec![] }])
-}
-
-/// 格式化并输出结果
-fn format_and_print_results(rows: Vec<Row>) {
-    println!("Results:");
-    for row in rows {
-        println!("{:?}", row);
+fn extract_insert_values(source_body: &SetExpr) -> Result<Vec<Row>, ExecutionError> { // Takes &SetExpr
+    match source_body { // No need for as_ref() if already &SetExpr
+        SetExpr::Values(values_list) => {
+            values_list.0.iter().map(|row_exprs| {
+                let values_vec: Result<Vec<Value>, ExecutionError> = row_exprs.iter().map(|expr| {
+                    match expr {
+                        Expr::Value(sqlparser::ast::Value::Number(s, _l)) => {
+                            s.parse::<i32>().map(Value::Int).map_err(|_| ExecutionError::SyntaxError)
+                        },
+                        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => Ok(Value::Varchar(s.clone())),
+                        Expr::Value(sqlparser::ast::Value::Boolean(b)) => Ok(Value::Varchar(b.to_string())), // Storing boolean as Varchar for now, consider dedicated type in Value enum
+                        Expr::Value(sqlparser::ast::Value::Null) => Ok(Value::Null),
+                        _ => Err(ExecutionError::UnsupportedStatement),
+                    }
+                }).collect();
+                values_vec.map(|values| Row { values })
+            }).collect()
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::storage_engine_interface::{Row, Value, Schema, ColumnDefinition, DataType, Constraint, Condition, StorageEngine};
-    use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
-    use sqlparser::ast::{Query, Statement};
+    use sqlparser::dialect::GenericDialect;
 
-    struct MockStorageEngine;
-    impl StorageEngine for MockStorageEngine {
-        fn create_table(&mut self, _table_name: &str, _schema: Schema) -> Result<(), String> { Ok(()) }
-        fn drop_table(&mut self, _table_name: &str) -> Result<(), String> { Ok(()) }
-        fn insert_row(&mut self, _table_name: &str, _row: Row) -> Result<(), String> { Ok(()) }
-        fn update_rows(&mut self, _table_name: &str, _updates: Vec<(String, Value)>, _condition: Option<Condition>) -> Result<u64, String> { Ok(1) }
-        fn delete_rows(&mut self, _table_name: &str, _condition: Option<Condition>) -> Result<u64, String> { Ok(1) }
-        fn select_rows(&self, _table_name: &str, _columns: Vec<String>, _condition: Option<Condition>) -> Result<Vec<Row>, String> {
-            Ok(vec![Row { values: vec![Value::Int(1), Value::Varchar("Alice".to_string())] }])
+    #[derive(Clone)]
+    struct MockExecutorStorageEngine {
+        tables: std::collections::HashMap<String, (Schema, Vec<Row>)>
+    }
+
+    impl MockExecutorStorageEngine {
+        fn new() -> Self {
+            MockExecutorStorageEngine { tables: std::collections::HashMap::new() }
         }
-        fn get_table_schema(&self, _table_name: &str) -> Result<Schema, String> {
-            Ok(Schema { columns: vec![
-                ColumnDefinition { name: "id".to_string(), data_type: DataType::Int(32), constraints: vec![Constraint::PrimaryKey] },
-                ColumnDefinition { name: "name".to_string(), data_type: DataType::Varchar(255), constraints: vec![] },
-            ] })
+    }
+
+    impl StorageEngine for MockExecutorStorageEngine {
+        fn create_table(&mut self, table_name: &str, schema: Schema) -> Result<(), String> {
+            if self.tables.contains_key(table_name) {
+                return Err(format!("Table {} already exists", table_name));
+            }
+            self.tables.insert(table_name.to_string(), (schema, Vec::new()));
+            Ok(())
+        }
+
+        fn drop_table(&mut self, table_name: &str) -> Result<(), String> {
+            if self.tables.remove(table_name).is_some() {
+                Ok(())
+            } else {
+                Err(format!("Table {} not found", table_name))
+            }
+        }
+
+        fn insert_row(&mut self, table_name: &str, row: Row) -> Result<(), String> {
+            match self.tables.get_mut(table_name) {
+                Some((_schema, rows)) => {
+                    rows.push(row);
+                    Ok(())
+                }
+                None => Err(format!("Table {} not found", table_name)),
+            }
+        }
+
+        fn update_rows(&mut self, _table_name: &str, _updates: Vec<(String, Value)>, _condition: Option<Condition>) -> Result<u64, String> {
+            unimplemented!()
+        }
+
+        fn delete_rows(&mut self, _table_name: &str, _condition: Option<Condition>) -> Result<u64, String> {
+            unimplemented!()
+        }
+
+        fn select_rows(&self, table_name: &str, columns: Vec<String>, condition: Option<Condition>) -> Result<Vec<Row>, String> {
+            match self.tables.get(table_name) {
+                Some((schema, rows)) => {
+                    let mut result_rows = Vec::new();
+                    for row in rows {
+                        if columns.contains(&"*".to_string()) || !columns.is_empty() {
+                            let mut projected_row_values = Vec::new();
+                            if columns.contains(&"*".to_string()) {
+                                projected_row_values = row.values.clone();
+                            } else {
+                                for col_name in &columns {
+                                    if let Some(idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                        projected_row_values.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
+                                    } else {
+                                        return Err(format!("Column {} not found in table {}", col_name, table_name));
+                                    }
+                                }
+                            }
+                            result_rows.push(Row { values: projected_row_values });
+                        }
+                    }
+                    Ok(result_rows)
+                }
+                None => Err(format!("Table {} not found", table_name)),
+            }
+        }
+
+        fn get_table_schema(&self, table_name: &str) -> Result<Schema, String> {
+            match self.tables.get(table_name) {
+                Some((schema, _)) => Ok(schema.clone()),
+                None => Err(format!("Table {} not found", table_name)),
+            }
+        }
+    }
+
+    fn parse_sql_to_statement(sql: &str) -> Statement {
+        Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0)
+    }
+
+    #[test]
+    fn test_execute_select_statement() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        let table_name = "test_table";
+        let schema = Schema {
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: StorageDataType::Int(32), constraints: vec![] },
+                ColumnDefinition { name: "name".to_string(), data_type: StorageDataType::Varchar(255), constraints: vec![] },
+            ]
+        };
+        mock_storage.create_table(table_name, schema.clone()).unwrap();
+        mock_storage.insert_row(table_name, Row { values: vec![Value::Int(1), Value::Varchar("Alice".to_string())] }).unwrap();
+
+        let sql = "SELECT id, name FROM test_table WHERE id = 1";
+        let statement = parse_sql_to_statement(sql);
+
+        match execute_ast(statement, &mut mock_storage) {
+            Ok(QueryResult::Data(rows)) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values[0], Value::Int(1));
+                assert_eq!(rows[0].values[1], Value::Varchar("Alice".to_string()));
+            }
+            Err(e) => panic!("Execution failed: {:?}", e),
+            _ => panic!("Unexpected query result type"),
         }
     }
 
     #[test]
-    fn test_handle_query() {
-        let sql = "SELECT id, name FROM users;";
-        let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, sql).unwrap();
-        if let Statement::Query(query) = &ast[0] {
-            let mut storage = MockStorageEngine;
-            let result = handle_query(query.clone(), &mut storage);
-            assert!(result.is_ok());
-        } else {
-            panic!("Not a query statement");
+    fn test_execute_insert_statement() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        let table_name = "test_table";
+        let schema = Schema {
+            columns: vec![
+                ColumnDefinition { name: "id".to_string(), data_type: StorageDataType::Int(32), constraints: vec![] },
+                ColumnDefinition { name: "name".to_string(), data_type: StorageDataType::Varchar(255), constraints: vec![] },
+            ]
+        };
+        mock_storage.create_table(table_name, schema.clone()).unwrap();
+
+        let sql = "INSERT INTO test_table (id, name) VALUES (1, \'Bob\')";
+        let statement = parse_sql_to_statement(sql);
+
+        match execute_ast(statement, &mut mock_storage) {
+            Ok(QueryResult::Success) => {
+                let selected_rows = mock_storage.select_rows(table_name, vec!["id".to_string(), "name".to_string()], None).unwrap();
+                assert_eq!(selected_rows.len(), 1);
+                assert_eq!(selected_rows[0].values[0], Value::Int(1));
+                assert_eq!(selected_rows[0].values[1], Value::Varchar("Bob".to_string()));
+            }
+            Err(e) => panic!("Execution failed: {:?}", e),
+            _ => panic!("Unexpected query result type for INSERT"),
         }
     }
 
     #[test]
-    fn test_handle_insert() {
-        let sql = "INSERT INTO users (id, name) VALUES (1, 'Alice');";
-        let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, sql).unwrap();
-        if let Statement::Insert { .. } = &ast[0] {
-            let mut storage = MockStorageEngine;
-            let result = handle_insert(ast[0].clone(), &mut storage);
-            assert!(result.is_ok());
-        } else {
-            panic!("Not an insert statement");
+    fn test_execute_create_table_statement() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        let sql = "CREATE TABLE new_users (id INT, email VARCHAR(100), created_at TIMESTAMP)";
+        let statement = parse_sql_to_statement(sql);
+
+        match execute_ast(statement, &mut mock_storage) {
+            Ok(QueryResult::Success) => {
+                let schema_result = mock_storage.get_table_schema("new_users");
+                assert!(schema_result.is_ok());
+                let schema = schema_result.unwrap();
+                assert_eq!(schema.columns.len(), 3);
+                assert_eq!(schema.columns[0].name, "id");
+                assert_eq!(schema.columns[0].data_type, StorageDataType::Int(32));
+                assert_eq!(schema.columns[1].name, "email");
+                assert_eq!(schema.columns[1].data_type, StorageDataType::Varchar(255)); // Defaulted in handler
+                assert_eq!(schema.columns[2].name, "created_at");
+                assert_eq!(schema.columns[2].data_type, StorageDataType::Varchar(29)); // Mapped from Timestamp
+            }
+            Err(e) => panic!("Execution failed: {:?}", e),
+            _ => panic!("Unexpected query result type for CREATE TABLE"),
         }
     }
 }

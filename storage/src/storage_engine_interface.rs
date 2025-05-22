@@ -72,20 +72,39 @@ pub trait StorageEngine {
 
 /// 表的 Schema 定义
 /// 描述表的结构，包括列名、数据类型和约束条件。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Schema {
     pub columns: Vec<ColumnDefinition>, // 列的定义列表
 }
 
 /// 表中的列定义
 /// 每一列的名称、数据类型以及约束条件。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,              // 列的名称
     pub data_type: DataType,       // 列的数据类型
     pub constraints: Vec<Constraint>, // 列的约束条件（如主键、非空）
 }
 
+/// 表中的一行数据
+/// 包含多个值，每个值对应一列的数据。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Row {
+    pub values: Vec<Value>, // 值列表
+}
+
+/// 值类型
+/// 表示表中每列可以存储的值。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Value {
+    Int(i32),         // 整数值
+    Varchar(String),  // 字符串值
+    Null,             // 空值
+}
+
 /// 数据类型
 /// 支持 INT 和 VARCHAR，并可以指定长度。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     Int(u32),      // 整数类型及位数
     Varchar(u32),  // 字符串类型及最大长度
@@ -93,27 +112,15 @@ pub enum DataType {
 
 /// 列约束条件
 /// 定义列的限制，如是否为主键、是否允许为空。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Constraint {
     PrimaryKey, // 该列为主键
     NotNull,    // 该列不能为空
 }
 
-/// 表中的一行数据
-/// 包含多个值，每个值对应一列的数据。
-pub struct Row {
-    pub values: Vec<Value>, // 值列表
-}
-
-/// 值类型
-/// 表示表中每列可以存储的值。
-pub enum Value {
-    Int(i32),         // 整数值
-    Varchar(String),  // 字符串值
-    Null,             // 空值
-}
-
 /// 条件表达式
 /// 用于表示 WHERE 子句中的条件。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Condition {
     Equals(String, Value),      // 列名等于某个值
     GreaterThan(String, Value), // 列名大于某个值
