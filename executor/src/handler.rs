@@ -29,26 +29,32 @@ fn handle_insert_stmt(table_name: &ObjectName, columns: &[Ident], source: &Query
     handle_insert(table_name, columns, source, storage_engine)?;
     Ok(QueryResult::Success)
 }
-
+/// 创建表
+///
+/// # 参数
+/// - `name`: 表名的 AST 对象
+/// - `ast_columns`: 列定义的 AST 数组
+/// - `storage_engine`: 存储引擎 trait 对象
+///
+/// # 返回
+/// - `Ok(QueryResult::Success)`：成功
+/// - `Err(ExecutionError)`：失败
 fn handle_create_table_stmt(name: &ObjectName, ast_columns: &[sqlparser::ast::ColumnDef], storage_engine: &mut dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
+    // 解析表名，如果解析失败，整个函数都返回。
+    // clone是因为因为我们建表也要拿到字符串的所有权，否则如果AST被释放，表名就没了。
     let table_name_str = name.0.get(0).ok_or(ExecutionError::SyntaxError)?.value.clone();
     let mut schema_columns = Vec::new();
     for col_def in ast_columns {
         let column_name = col_def.name.value.clone();
-        let data_type = match col_def.data_type {
-            SQLDataType::Int(_) => StorageDataType::Int(32),
-            SQLDataType::Varchar(_) => StorageDataType::Varchar(255),
-            SQLDataType::SmallInt(_) => StorageDataType::Int(16),
-            SQLDataType::BigInt(_) => StorageDataType::Int(64),
-            SQLDataType::Char(_) => StorageDataType::Varchar(255),
-            SQLDataType::Decimal(_, _) => StorageDataType::Varchar(255),
-            SQLDataType::Float(_) => StorageDataType::Varchar(255),
-            SQLDataType::Real => StorageDataType::Varchar(255),
-            SQLDataType::Double => StorageDataType::Varchar(255),
-            SQLDataType::Boolean => StorageDataType::Varchar(5),
-            SQLDataType::Date => StorageDataType::Varchar(10),
-            SQLDataType::Time => StorageDataType::Varchar(8),
-            SQLDataType::Timestamp => StorageDataType::Varchar(29),
+        let data_type = match &col_def.data_type {
+            SQLDataType::Int(opt_len) => {
+                let len = opt_len.map(|n| n as u32).unwrap_or(32);
+                StorageDataType::Int(len)
+            },
+            SQLDataType::Varchar(opt_len) => {
+                let len = opt_len.map(|n| n as u32).unwrap_or(255);
+                StorageDataType::Varchar(len)
+            },
             _ => return Err(ExecutionError::UnsupportedStatement),
         };
         schema_columns.push(ColumnDefinition {
@@ -403,7 +409,8 @@ pub mod tests {
     #[test]
     fn test_execute_create_table_statement() {
         let mut mock_storage = MockExecutorStorageEngine::new();
-        let sql = "CREATE TABLE new_users (id INT, email VARCHAR(100), created_at TIMESTAMP)";
+        // 只用 INT 和 VARCHAR 类型
+        let sql = "CREATE TABLE new_users (id INT, email VARCHAR(100));";
         let statement = parse_sql_to_statement(sql);
 
         match execute_stmt(statement, &mut mock_storage) {
@@ -411,13 +418,11 @@ pub mod tests {
                 let schema_result = mock_storage.get_table_schema("new_users");
                 assert!(schema_result.is_ok());
                 let schema = schema_result.unwrap();
-                assert_eq!(schema.columns.len(), 3);
+                assert_eq!(schema.columns.len(), 2);
                 assert_eq!(schema.columns[0].name, "id");
                 assert_eq!(schema.columns[0].data_type, StorageDataType::Int(32));
                 assert_eq!(schema.columns[1].name, "email");
-                assert_eq!(schema.columns[1].data_type, StorageDataType::Varchar(255)); // Defaulted in handler
-                assert_eq!(schema.columns[2].name, "created_at");
-                assert_eq!(schema.columns[2].data_type, StorageDataType::Varchar(29)); // Mapped from Timestamp
+                assert_eq!(schema.columns[1].data_type, StorageDataType::Varchar(100));
             }
             Err(e) => panic!("Execution failed: {:?}", e),
             _ => panic!("Unexpected query result type for CREATE TABLE"),

@@ -50,9 +50,9 @@ pub mod tests {
         let schema = schema_result.unwrap();
         assert_eq!(schema.columns.len(), 2);
         assert_eq!(schema.columns[0].name, "id");
-        assert_eq!(schema.columns[0].data_type, StorageDataType::Int(32)); // Assuming default Int mapping
+        assert_eq!(schema.columns[0].data_type, StorageDataType::Int(32)); // Int default
         assert_eq!(schema.columns[1].name, "name");
-        assert_eq!(schema.columns[1].data_type, StorageDataType::Varchar(255)); // Assuming default Varchar mapping
+        assert_eq!(schema.columns[1].data_type, StorageDataType::Varchar(100)); // Varchar(100)
 
         // Verify insertion
         let selected_rows_result = mock_storage.select_rows("multi_exec_test", vec!["id".to_string(), "name".to_string()], None);
