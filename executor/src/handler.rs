@@ -10,50 +10,66 @@ pub enum QueryResult {
     Success, // For statements like CREATE TABLE, INSERT without returning data
 }
 
-pub fn execute_ast(statement: Statement, storage_engine: &mut dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
+pub fn execute_stmt(statement: Statement, storage_engine: &mut dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
     match statement {
-        Statement::Query(query) => {
-            let rows = handle_query(&query, storage_engine)?; // Pass Box<Query> by reference
-            Ok(QueryResult::Data(rows))
-        }
-        Statement::Insert { table_name, columns, source, .. } => {
-            handle_insert(&table_name, &columns, &source, storage_engine)?; // Pass Box<Query> by reference
-            Ok(QueryResult::Success)
-        }
-        Statement::CreateTable { name, columns: ast_columns, .. } => {
-            let table_name_str = name.0.get(0).ok_or(ExecutionError::SyntaxError)?.value.clone();
-            let mut schema_columns = Vec::new();
-            for col_def in ast_columns {
-                let column_name = col_def.name.value.clone();
-                let data_type = match col_def.data_type {
-                    SQLDataType::Int(_) => StorageDataType::Int(32),
-                    SQLDataType::Varchar(_) => StorageDataType::Varchar(255),
-                    SQLDataType::SmallInt(_) => StorageDataType::Int(16),
-                    SQLDataType::BigInt(_) => StorageDataType::Int(64),
-                    SQLDataType::Char(_) => StorageDataType::Varchar(255), // Map Char to Varchar
-                    SQLDataType::Decimal(_, _) => StorageDataType::Varchar(255), // Map Decimal to Varchar for simplicity
-                    SQLDataType::Float(_) => StorageDataType::Varchar(255), // Map Float to Varchar for simplicity
-                    SQLDataType::Real => StorageDataType::Varchar(255), // Map Real to Varchar for simplicity
-                    SQLDataType::Double => StorageDataType::Varchar(255), // Map Double to Varchar for simplicity
-                    SQLDataType::Boolean => StorageDataType::Varchar(5), // Map Boolean to Varchar("true"/"false")
-                    SQLDataType::Date => StorageDataType::Varchar(10), // Map Date to Varchar (YYYY-MM-DD)
-                    SQLDataType::Time => StorageDataType::Varchar(8), // Corrected: Time variant without arguments
-                    SQLDataType::Timestamp => StorageDataType::Varchar(29), // Corrected: Timestamp variant without arguments
-                    // Add other specific sqlparser DataType variants as they are used or needed
-                    _ => return Err(ExecutionError::UnsupportedStatement), // Catch-all for unhandled types
-                };
-                schema_columns.push(ColumnDefinition {
-                    name: column_name,
-                    data_type,
-                    constraints: Vec::new(), // TODO: Parse constraints
-                });
-            }
-            let schema = Schema { columns: schema_columns };
-            storage_engine.create_table(&table_name_str, schema)
-                .map_err(ExecutionError::StorageError)?;
-            Ok(QueryResult::Success)
-        }
+        Statement::Query(query) => handle_query_stmt(&query, storage_engine),
+        Statement::Insert { table_name, columns, source, .. } => handle_insert_stmt(&table_name, &columns, &source, storage_engine),
+        Statement::CreateTable { name, columns: ast_columns, .. } => handle_create_table_stmt(&name, &ast_columns, storage_engine),
+        Statement::Drop { object_type, if_exists, names, .. } => handle_drop_table_stmt(&object_type, if_exists, &names, storage_engine),
         _ => Err(ExecutionError::UnsupportedStatement),
+    }
+}
+
+fn handle_query_stmt(query: &Query, storage_engine: &dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
+    let rows = handle_query(query, storage_engine)?;
+    Ok(QueryResult::Data(rows))
+}
+
+fn handle_insert_stmt(table_name: &ObjectName, columns: &[Ident], source: &Query, storage_engine: &mut dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
+    handle_insert(table_name, columns, source, storage_engine)?;
+    Ok(QueryResult::Success)
+}
+
+fn handle_create_table_stmt(name: &ObjectName, ast_columns: &[sqlparser::ast::ColumnDef], storage_engine: &mut dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
+    let table_name_str = name.0.get(0).ok_or(ExecutionError::SyntaxError)?.value.clone();
+    let mut schema_columns = Vec::new();
+    for col_def in ast_columns {
+        let column_name = col_def.name.value.clone();
+        let data_type = match col_def.data_type {
+            SQLDataType::Int(_) => StorageDataType::Int(32),
+            SQLDataType::Varchar(_) => StorageDataType::Varchar(255),
+            SQLDataType::SmallInt(_) => StorageDataType::Int(16),
+            SQLDataType::BigInt(_) => StorageDataType::Int(64),
+            SQLDataType::Char(_) => StorageDataType::Varchar(255),
+            SQLDataType::Decimal(_, _) => StorageDataType::Varchar(255),
+            SQLDataType::Float(_) => StorageDataType::Varchar(255),
+            SQLDataType::Real => StorageDataType::Varchar(255),
+            SQLDataType::Double => StorageDataType::Varchar(255),
+            SQLDataType::Boolean => StorageDataType::Varchar(5),
+            SQLDataType::Date => StorageDataType::Varchar(10),
+            SQLDataType::Time => StorageDataType::Varchar(8),
+            SQLDataType::Timestamp => StorageDataType::Varchar(29),
+            _ => return Err(ExecutionError::UnsupportedStatement),
+        };
+        schema_columns.push(ColumnDefinition {
+            name: column_name,
+            data_type,
+            constraints: Vec::new(),
+        });
+    }
+    let schema = Schema { columns: schema_columns };
+    storage_engine.create_table(&table_name_str, schema)
+        .map_err(ExecutionError::StorageError)?;
+    Ok(QueryResult::Success)
+}
+
+fn handle_drop_table_stmt(object_type: &sqlparser::ast::ObjectType, _if_exists: bool, names: &[ObjectName], storage_engine: &mut dyn StorageEngine) -> Result<QueryResult, ExecutionError> {
+    if object_type.to_string().to_uppercase() == "TABLE" {
+        let table_name = names.get(0).and_then(|n| n.0.get(0)).map(|id| id.value.clone()).ok_or(ExecutionError::SyntaxError)?;
+        storage_engine.drop_table(&table_name).map_err(ExecutionError::StorageError)?;
+        Ok(QueryResult::Success)
+    } else {
+        Err(ExecutionError::UnsupportedStatement)
     }
 }
 
@@ -346,7 +362,7 @@ pub mod tests {
         let sql = "SELECT id, name FROM test_table WHERE id = 1";
         let statement = parse_sql_to_statement(sql);
 
-        match execute_ast(statement, &mut mock_storage) {
+        match execute_stmt(statement, &mut mock_storage) {
             Ok(QueryResult::Data(rows)) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].values[0], Value::Int(1));
@@ -372,7 +388,7 @@ pub mod tests {
         let sql = "INSERT INTO test_table (id, name) VALUES (1, \'Bob\')";
         let statement = parse_sql_to_statement(sql);
 
-        match execute_ast(statement, &mut mock_storage) {
+        match execute_stmt(statement, &mut mock_storage) {
             Ok(QueryResult::Success) => {
                 let selected_rows = mock_storage.select_rows(table_name, vec!["id".to_string(), "name".to_string()], None).unwrap();
                 assert_eq!(selected_rows.len(), 1);
@@ -390,7 +406,7 @@ pub mod tests {
         let sql = "CREATE TABLE new_users (id INT, email VARCHAR(100), created_at TIMESTAMP)";
         let statement = parse_sql_to_statement(sql);
 
-        match execute_ast(statement, &mut mock_storage) {
+        match execute_stmt(statement, &mut mock_storage) {
             Ok(QueryResult::Success) => {
                 let schema_result = mock_storage.get_table_schema("new_users");
                 assert!(schema_result.is_ok());
@@ -474,7 +490,7 @@ pub mod tests {
         let sql = "INSERT INTO multi_insert_table (id, item) VALUES (1, 'Apple'), (2, 'Banana'), (3, 'Cherry')";
         let statement = parse_sql_to_statement(sql);
 
-        match execute_ast(statement, &mut mock_storage) {
+        match execute_stmt(statement, &mut mock_storage) {
             Ok(QueryResult::Success) => {
                 let selected_rows = mock_storage.select_rows(table_name, vec!["id".to_string(), "item".to_string()], None).unwrap();
                 assert_eq!(selected_rows.len(), 3);
@@ -505,7 +521,7 @@ pub mod tests {
         let sql = "INSERT INTO null_test_table (id, description) VALUES (1, NULL)";
         let statement = parse_sql_to_statement(sql);
 
-        match execute_ast(statement, &mut mock_storage) {
+        match execute_stmt(statement, &mut mock_storage) {
             Ok(QueryResult::Success) => {
                 let selected_rows = mock_storage.select_rows(table_name, vec!["id".to_string(), "description".to_string()], None).unwrap();
                 assert_eq!(selected_rows.len(), 1);
@@ -515,5 +531,26 @@ pub mod tests {
             Err(e) => panic!("Execution failed: {:?}", e),
             _ => panic!("Unexpected query result type for INSERT"),
         }
+    }
+
+    #[test]
+    fn test_execute_drop_table_statement() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        let create_sql = "CREATE TABLE drop_test (id INT, name VARCHAR(100));";
+        let drop_sql = "DROP TABLE drop_test;";
+        let create_stmt = parse_sql_to_statement(create_sql);
+        let drop_stmt = parse_sql_to_statement(drop_sql);
+        // 创建表
+        let res = execute_stmt(create_stmt, &mut mock_storage);
+        assert!(res.is_ok(), "CREATE TABLE should succeed");
+        // 确认表存在
+        let schema_res = mock_storage.get_table_schema("drop_test");
+        assert!(schema_res.is_ok(), "Table should exist after CREATE TABLE");
+        // 删除表
+        let res = execute_stmt(drop_stmt, &mut mock_storage);
+        assert!(res.is_ok(), "DROP TABLE should succeed");
+        // 确认表已删除
+        let schema_res = mock_storage.get_table_schema("drop_test");
+        assert!(schema_res.is_err(), "Table should not exist after DROP TABLE");
     }
 }

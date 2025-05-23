@@ -11,10 +11,10 @@ use sqlparser;
 pub fn execute_ast(ast: Vec<sqlparser::ast::Statement>, storage_engine: &mut dyn StorageEngine) -> Result<(), ExecutionError> {
     for statement in ast {
         // 调用 handler.rs 中的 execute_ast 来处理单个语句
-        // '?' 操作符会处理 Result：
+        // '?'的意思是：如果前面的语句返回 Ok，则继续执行；如果返回 Err，则当前函数（execute_ast）也返回 Err。
         // - 如果是 Ok(QueryResult)，则 QueryResult 会被丢弃（因为表达式的结果未被赋值）。
         // - 如果是 Err(ExecutionError)，错误会向上传播，此函数将提前返回。
-        handler::execute_ast(statement, storage_engine)?;
+        handler::execute_stmt(statement, storage_engine)?;
     }
     Ok(())
 }
@@ -23,7 +23,7 @@ pub fn execute_ast(ast: Vec<sqlparser::ast::Statement>, storage_engine: &mut dyn
 pub use handler::*;
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use super::handler::tests::MockExecutorStorageEngine; 
     use super::handler::QueryResult; 
@@ -81,7 +81,7 @@ mod tests {
         
         // We need to call handler::execute_ast for a single query to get QueryResult::Data
         // The execute_ast in lib.rs returns Result<(), ExecutionError>
-        match handler::execute_ast(select_statements[0].clone(), &mut mock_storage) {
+        match handler::execute_stmt(select_statements[0].clone(), &mut mock_storage) {
             Ok(QueryResult::Data(rows)) => {
                 assert_eq!(rows.len(), 2, "Expected two users with age 30");
                 // Check first user (Alice)
