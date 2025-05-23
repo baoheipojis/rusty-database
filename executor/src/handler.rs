@@ -189,19 +189,21 @@ fn extract_insert_values(source_body: &SetExpr) -> Result<Vec<Row>, ExecutionErr
     }
 }
 
+// cfg是configuration，表示只在test模式下编译。
 #[cfg(test)]
-mod tests {
+pub mod tests {
+    // 导入父模块中所有公开的项
     use super::*;
     use sqlparser::parser::Parser;
     use sqlparser::dialect::GenericDialect;
 
     #[derive(Clone)]
-    struct MockExecutorStorageEngine {
+    pub struct MockExecutorStorageEngine {
         tables: std::collections::HashMap<String, (Schema, Vec<Row>)>
     }
 
     impl MockExecutorStorageEngine {
-        fn new() -> Self {
+        pub fn new() -> Self {
             MockExecutorStorageEngine { tables: std::collections::HashMap::new() }
         }
     }
@@ -241,26 +243,74 @@ mod tests {
             unimplemented!()
         }
 
-        fn select_rows(&self, table_name: &str, columns: Vec<String>, condition: Option<Condition>) -> Result<Vec<Row>, String> {
+        fn select_rows(&self, table_name: &str, columns: Vec<String>, condition: Option<Condition>) -> Result<Vec<Row>, String> { // Removed _ from condition
             match self.tables.get(table_name) {
-                Some((schema, rows)) => {
-                    let mut result_rows = Vec::new();
-                    for row in rows {
-                        if columns.contains(&"*".to_string()) || !columns.is_empty() {
-                            let mut projected_row_values = Vec::new();
-                            if columns.contains(&"*".to_string()) {
-                                projected_row_values = row.values.clone();
+                Some((schema, all_rows)) => {
+                    let mut filtered_rows = Vec::new();
+
+                    for row in all_rows {
+                        let mut matches_condition = true; // Assume true if no condition or if condition is met
+                        if let Some(cond) = &condition {
+                            // Determine the column name and expected value from the condition
+                            let (cond_col_name_str, expected_val_opt, op_type) = match cond {
+                                Condition::Equals(name, val) => (name.as_str(), Some(val), "eq"),
+                                Condition::GreaterThan(name, val) => (name.as_str(), Some(val), "gt"),
+                                Condition::LessThan(name, val) => (name.as_str(), Some(val), "lt"),
+                                Condition::IsNull(name) => (name.as_str(), None, "isnull"),
+                                Condition::IsNotNull(name) => (name.as_str(), None, "isnotnull"),
+                                // If other conditions are added to the Condition enum, they'd need handling here
+                            };
+
+                            if let Some(col_idx) = schema.columns.iter().position(|c| c.name == cond_col_name_str) {
+                                let actual_value = &row.values[col_idx];
+                                
+                                matches_condition = match op_type {
+                                    "eq" => expected_val_opt.map_or(false, |ev| actual_value == ev),
+                                    "gt" => match (actual_value, expected_val_opt) {
+                                        (Value::Int(a), Some(Value::Int(e))) => a > e,
+                                        (Value::Varchar(a), Some(Value::Varchar(e))) => a > e,
+                                        _ => false, // Type mismatch or not comparable for GT
+                                    },
+                                    "lt" => match (actual_value, expected_val_opt) {
+                                        (Value::Int(a), Some(Value::Int(e))) => a < e,
+                                        (Value::Varchar(a), Some(Value::Varchar(e))) => a < e,
+                                        _ => false, // Type mismatch or not comparable for LT
+                                    },
+                                    "isnull" => matches!(actual_value, Value::Null),
+                                    "isnotnull" => !matches!(actual_value, Value::Null),
+                                    _ => false, // Should not happen
+                                };
                             } else {
-                                for col_name in &columns {
-                                    if let Some(idx) = schema.columns.iter().position(|c| &c.name == col_name) {
-                                        projected_row_values.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
-                                    } else {
-                                        return Err(format!("Column {} not found in table {}", col_name, table_name));
-                                    }
+                                return Err(format!("Column {} in condition not found in table {}", cond_col_name_str, table_name));
+                            }
+                        }
+
+                        if matches_condition {
+                            filtered_rows.push(row.clone());
+                        }
+                    }
+
+                    // Projection logic (operates on filtered_rows)
+                    let mut result_rows = Vec::new();
+                    for row_to_project in &filtered_rows {
+                        let mut projected_row_values = Vec::new();
+                        if columns.contains(&"*".to_string()) || columns.is_empty() { // Treat empty columns list as SELECT *
+                            projected_row_values = row_to_project.values.clone();
+                        } else {
+                            for col_name in &columns {
+                                if let Some(idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                    projected_row_values.push(row_to_project.values.get(idx).cloned().unwrap_or(Value::Null));
+                                } else {
+                                    return Err(format!("Column {} not found for projection in table {}", col_name, table_name));
                                 }
                             }
-                            result_rows.push(Row { values: projected_row_values });
                         }
+                        if !projected_row_values.is_empty() || columns.contains(&"*".to_string()) { // Ensure we add a row if * or specific columns led to values
+                           result_rows.push(Row { values: projected_row_values });
+                        } else if columns.is_empty() && schema.columns.is_empty() { // Handle SELECT * from empty schema table
+                           result_rows.push(Row { values: vec![] });
+                        }
+
                     }
                     Ok(result_rows)
                 }
