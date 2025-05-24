@@ -188,4 +188,83 @@ pub mod tests {
             "Mouse not found with correct data"
         );
     }
+
+    #[test]
+    fn test_execute_sql_with_comments() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 测试包含注释的完整SQL脚本
+        let sql_script = "
+            -- 创建用户表
+            CREATE TABLE users_with_comments (
+                id INT PRIMARY KEY, /* 用户ID，主键 */
+                username VARCHAR(50) NOT NULL, -- 用户名，不能为空
+                email VARCHAR(100) /* 邮箱地址 */
+            );
+            
+            /* 插入测试用户数据 */
+            INSERT INTO users_with_comments (id, username, email) VALUES 
+                (1, 'admin', 'admin@example.com'), -- 管理员账户
+                (2, 'user1', 'user1@example.com'); /* 普通用户 */
+        ";
+        
+        let statements = parse_sql_to_statements(sql_script);
+        let result = execute_ast(statements, &mut mock_storage);
+        
+        assert!(result.is_ok(), "带注释的SQL脚本应该执行成功: {:?}", result.err());
+        
+        // 验证结果
+        let schema = mock_storage.get_table_schema("users_with_comments").unwrap();
+        assert_eq!(schema.columns.len(), 3);
+        
+        let rows = mock_storage.select_rows(
+            "users_with_comments",
+            vec!["id".to_string(), "username".to_string(), "email".to_string()],
+            None
+        ).unwrap();
+        assert_eq!(rows.len(), 2, "应该插入了两个用户");
+    }
+
+    #[test]
+    fn test_execute_create_table_with_int_specifications() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 测试不同INT长度规格的混合SQL
+        let sql_script = "
+            CREATE TABLE data_types_test (
+                tiny_id INT(1),        -- 1位整数
+                small_id INT(16),      -- 16位整数  
+                regular_id INT,        -- 默认长度整数
+                big_id INT(128),       -- 128位整数
+                description VARCHAR(200)  -- 描述字段
+            );
+            
+            INSERT INTO data_types_test (tiny_id, small_id, regular_id, big_id, description) 
+            VALUES (1, 1000, 50000, 9999999, 'Test record');
+        ";
+        
+        let statements = parse_sql_to_statements(sql_script);
+        let result = execute_ast(statements, &mut mock_storage);
+        
+        assert!(result.is_ok(), "INT长度规格测试应该执行成功: {:?}", result.err());
+        
+        // 验证表结构
+        let schema = mock_storage.get_table_schema("data_types_test").unwrap();
+        assert_eq!(schema.columns.len(), 5);
+        
+        // 验证各列的数据类型和长度
+        assert_eq!(schema.columns[0].data_type, StorageDataType::Int(1));
+        assert_eq!(schema.columns[1].data_type, StorageDataType::Int(16)); 
+        assert_eq!(schema.columns[2].data_type, StorageDataType::Int(32)); // 默认
+        assert_eq!(schema.columns[3].data_type, StorageDataType::Int(128));
+        assert_eq!(schema.columns[4].data_type, StorageDataType::Varchar(200));
+        
+        // 验证数据插入
+        let rows = mock_storage.select_rows(
+            "data_types_test",
+            vec!["tiny_id".to_string(), "small_id".to_string(), "regular_id".to_string(), "big_id".to_string()],
+            None
+        ).unwrap();
+        assert_eq!(rows.len(), 1, "应该有一条测试记录");
+    }
 }

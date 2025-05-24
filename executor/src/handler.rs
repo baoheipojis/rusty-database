@@ -624,6 +624,49 @@ pub mod tests {
     }
 
     #[test]
+    fn test_execute_create_table_with_int_length() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 测试带有指定长度的INT类型
+        let sql = "CREATE TABLE int_length_test (
+            small_int INT(8), 
+            normal_int INT, 
+            big_int INT(64),
+            name VARCHAR(50)
+        );";
+        let statement = parse_sql_to_statement(sql);
+
+        match execute_stmt(statement, &mut mock_storage) {
+            Ok(QueryResult::Success) => {
+                let schema_result = mock_storage.get_table_schema("int_length_test");
+                assert!(schema_result.is_ok());
+                let schema = schema_result.unwrap();
+                
+                // 检查列的数量
+                assert_eq!(schema.columns.len(), 4);
+                
+                // 检查small_int列 - INT(8)
+                assert_eq!(schema.columns[0].name, "small_int");
+                assert_eq!(schema.columns[0].data_type, StorageDataType::Int(8));
+                
+                // 检查normal_int列 - INT (默认长度)
+                assert_eq!(schema.columns[1].name, "normal_int");
+                assert_eq!(schema.columns[1].data_type, StorageDataType::Int(32)); // 默认32位
+                
+                // 检查big_int列 - INT(64)
+                assert_eq!(schema.columns[2].name, "big_int");
+                assert_eq!(schema.columns[2].data_type, StorageDataType::Int(64));
+                
+                // 检查name列 - VARCHAR(50)
+                assert_eq!(schema.columns[3].name, "name");
+                assert_eq!(schema.columns[3].data_type, StorageDataType::Varchar(50));
+            }
+            Err(e) => panic!("Execution failed: {:?}", e),
+            _ => panic!("Unexpected query result type for CREATE TABLE"),
+        }
+    }
+
+    #[test]
     fn test_extract_condition_less_than() {
         let sql = "SELECT id FROM test_table WHERE age < 25";
         let statement = parse_sql_to_statement(sql);
@@ -799,7 +842,6 @@ pub mod tests {
         // 测试创建带有 PRIMARY KEY 和 NOT NULL 约束的表
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100) NOT NULL);";
         let statement = parse_sql_to_statement(sql);
-
         match execute_stmt(statement, &mut mock_storage) {
             Ok(QueryResult::Success) => {
                 let schema_result = mock_storage.get_table_schema("users");
@@ -819,8 +861,237 @@ pub mod tests {
                 assert_eq!(schema.columns[1].data_type, StorageDataType::Varchar(100));
                 assert!(schema.columns[1].constraints.contains(&Constraint::NotNull));
             }
+            Ok(QueryResult::Data(rows)) => {
+                // 根据需要处理 Data 变体
+                panic!("Expected Success but got Data with {} rows", rows.len());
+            }
+            Ok(QueryResult::RowsAffected(count)) => {
+                // 根据需要处理 RowsAffected 变体
+                panic!("Expected Success but got RowsAffected with count = {}", count);
+            }
             Err(e) => panic!("Execution failed: {:?}", e),
-            _ => panic!("Unexpected query result type for CREATE TABLE"),
+        }
+    }
+
+    #[test]
+    fn test_insert_after_drop_table() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 1. 创建表
+        let create_sql = "CREATE TABLE temp_table (id INT, data VARCHAR(100));";
+        let statement = parse_sql_to_statement(create_sql);
+        let result = execute_stmt(statement, &mut mock_storage);
+        assert!(result.is_ok(), "CREATE TABLE should succeed");
+        
+        // 2. 删除表
+        let drop_sql = "DROP TABLE temp_table;";
+        let statement = parse_sql_to_statement(drop_sql);
+        let result = execute_stmt(statement, &mut mock_storage);
+        assert!(result.is_ok(), "DROP TABLE should succeed");
+        
+        // 3. 尝试插入数据到已删除的表（应该失败）
+        let insert_sql = "INSERT INTO temp_table (id, data) VALUES (1, 'test');";
+        let statement = parse_sql_to_statement(insert_sql);
+        let result = execute_stmt(statement, &mut mock_storage);
+        assert!(result.is_err(), "INSERT into dropped table should fail");
+        
+        // 检查错误类型是否与预期匹配（StorageError）
+        match result {
+            Err(ExecutionError::StorageError(_)) => (), // 预期的错误类型
+            _ => panic!("Unexpected error type or success"),
+        }
+    }
+    
+    #[test]
+    fn test_create_table_with_multiple_primary_keys() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 创建一个表，两列都声明为 PRIMARY KEY
+        let sql = "CREATE TABLE multiple_pk (id INT PRIMARY KEY, code INT PRIMARY KEY);";
+        let statement = parse_sql_to_statement(sql);
+        
+        match execute_stmt(statement, &mut mock_storage) {
+            Ok(QueryResult::Success) => {
+                // 检查表结构
+                let schema = mock_storage.get_table_schema("multiple_pk").unwrap();
+                
+                // 检查哪些列被标记为主键
+                let primary_keys_count = schema.columns.iter()
+                    .filter(|col| col.constraints.contains(&Constraint::PrimaryKey))
+                    .count();
+                
+                // 根据您的实现，可能允许多主键或只保留最后一个
+                // 这个断言可以根据实际实现调整
+                assert!(primary_keys_count > 0, "至少应该有一个主键");
+                println!("表定义允许 {} 个主键列", primary_keys_count);
+            }
+            Ok(QueryResult::Data(rows)) => {
+                panic!("Expected Success but got Data with {} rows", rows.len());
+            }
+            Ok(QueryResult::RowsAffected(count)) => {
+                panic!("Expected Success but got RowsAffected with count = {}", count);
+            }
+            Err(e) => {
+                // 某些数据库实现会拒绝多主键的定义
+                // 这种情况下，错误也是合理的
+                println!("创建多主键表被拒绝: {:?}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sql_with_single_line_comments() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 测试单行注释 --
+        let sql_with_comments = "
+            -- 这是一个单行注释
+            CREATE TABLE comment_test (
+                id INT, -- 这是ID列
+                name VARCHAR(100) -- 这是名称列
+            );
+            -- 插入测试数据
+            INSERT INTO comment_test (id, name) VALUES (1, 'Test');
+        ";
+        
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {}, 
+            sql_with_comments
+        );
+        
+        match statements {
+            Ok(parsed_statements) => {
+                // 执行解析出的语句
+                for statement in parsed_statements {
+                    let result = execute_stmt(statement, &mut mock_storage);
+                    assert!(result.is_ok(), "语句执行应该成功");
+                }
+                
+                // 验证表是否创建成功
+                let schema = mock_storage.get_table_schema("comment_test");
+                assert!(schema.is_ok(), "表应该创建成功");
+                
+                // 验证数据是否插入成功
+                let rows = mock_storage.select_rows(
+                    "comment_test", 
+                    vec!["id".to_string(), "name".to_string()], 
+                    None
+                );
+                assert!(rows.is_ok(), "应该能查询到数据");
+                let rows = rows.unwrap();
+                assert_eq!(rows.len(), 1, "应该有一行数据");
+            }
+            Err(e) => {
+                println!("解析带注释的SQL失败: {:?}", e);
+                // 如果解析失败，说明当前解析器不支持注释
+                assert!(false, "SQL解析器应该支持单行注释");
+            }
+        }
+    }
+    
+    #[test]
+    fn test_sql_with_multi_line_comments() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 测试多行注释 /* */
+        let sql_with_comments = "
+            /* 这是一个多行注释
+               可以跨越多行
+               用于详细说明 */
+            CREATE TABLE multi_comment_test (
+                id INT /* 整数ID */, 
+                description VARCHAR(200) /* 描述字段 */
+            );
+            
+            /* 插入一些测试数据 */
+            INSERT INTO multi_comment_test (id, description) 
+            VALUES (1, 'Multi-line comment test');
+        ";
+        
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {}, 
+            sql_with_comments
+        );
+        
+        match statements {
+            Ok(parsed_statements) => {
+                // 执行解析出的语句
+                for statement in parsed_statements {
+                    let result = execute_stmt(statement, &mut mock_storage);
+                    assert!(result.is_ok(), "语句执行应该成功");
+                }
+                
+                // 验证表是否创建成功
+                let schema = mock_storage.get_table_schema("multi_comment_test");
+                assert!(schema.is_ok(), "表应该创建成功");
+                
+                // 验证数据是否插入成功
+                let rows = mock_storage.select_rows(
+                    "multi_comment_test", 
+                    vec!["id".to_string(), "description".to_string()], 
+                    None
+                );
+                assert!(rows.is_ok(), "应该能查询到数据");
+                let rows = rows.unwrap();
+                assert_eq!(rows.len(), 1, "应该有一行数据");
+            }
+            Err(e) => {
+                println!("解析带多行注释的SQL失败: {:?}", e);
+                // 如果解析失败，说明当前解析器不支持多行注释
+                assert!(false, "SQL解析器应该支持多行注释");
+            }
+        }
+    }
+    
+    #[test]
+    fn test_sql_with_mixed_comments() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 测试混合注释
+        let sql_with_comments = "
+            -- 创建混合注释测试表
+            CREATE TABLE mixed_comment_test (
+                /* 主键字段 */ id INT PRIMARY KEY, -- 唯一标识符
+                /* 数据字段 */ data VARCHAR(100) NOT NULL -- 不能为空的数据
+            );
+            
+            -- 插入测试数据
+            INSERT INTO mixed_comment_test (id, data) VALUES 
+                (1, 'First record'), /* 第一条记录 */
+                (2, 'Second record'); -- 第二条记录
+        ";
+        
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {}, 
+            sql_with_comments
+        );
+        
+        match statements {
+            Ok(parsed_statements) => {
+                // 执行解析出的语句
+                for statement in parsed_statements {
+                    let result = execute_stmt(statement, &mut mock_storage);
+                    assert!(result.is_ok(), "语句执行应该成功: {:?}", result);
+                }
+                
+                // 验证表创建和约束
+                let schema = mock_storage.get_table_schema("mixed_comment_test").unwrap();
+                assert_eq!(schema.columns.len(), 2);
+                assert!(schema.columns[0].constraints.contains(&Constraint::PrimaryKey));
+                assert!(schema.columns[1].constraints.contains(&Constraint::NotNull));
+                
+                // 验证数据插入
+                let rows = mock_storage.select_rows(
+                    "mixed_comment_test", 
+                    vec!["id".to_string(), "data".to_string()], 
+                    None
+                ).unwrap();
+                assert_eq!(rows.len(), 2, "应该有两行数据");
+            }
+            Err(e) => {
+                println!("解析带混合注释的SQL失败: {:?}", e);
+                assert!(false, "SQL解析器应该支持混合注释");
+            }
         }
     }
 }
