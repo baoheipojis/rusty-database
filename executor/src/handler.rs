@@ -4,8 +4,8 @@ use sqlparser::ast::{
     Statement, TableFactor,
 }; // Renamed DataType, removed unused Values
 use storage::storage_engine_interface::{
-    ColumnDefinition, Condition, DataType as StorageDataType, Row, Schema, StorageEngine, Value,
-}; // Renamed DataType to avoid conflict
+    ColumnDefinition, Condition, Constraint, DataType as StorageDataType, Row, Schema, StorageEngine, Value,
+}; // Added Constraint import
 
 // Represents the result of a query execution
 #[derive(Debug)]
@@ -85,8 +85,12 @@ fn handle_create_table_stmt(
     let mut schema_columns = Vec::new();
     for col_def in ast_columns {
         let column_name = col_def.name.value.clone();
+        // 我们只用支持INT和VARCHAR类型
         let data_type = match &col_def.data_type {
+            // Int(opt_len)，后面的数字是可选的长度
             SQLDataType::Int(opt_len) => {
+                // map的意思是：如果是Some(n)，就把n转换成u32，它的参数是一个函数。
+                // unwrap_or是Option的方法，如果是Some(n)，就返回n；如果是None，就返回后面的值。
                 let len = opt_len.map(|n| n as u32).unwrap_or(32);
                 StorageDataType::Int(len)
             }
@@ -96,10 +100,27 @@ fn handle_create_table_stmt(
             }
             _ => return Err(ExecutionError::UnsupportedStatement),
         };
+        // 处理约束 - 支持 NOT NULL 和 PRIMARY KEY
+        let constraints = col_def
+            .options
+            .iter()
+            .filter_map(|opt| {
+                match &opt.option {
+                    sqlparser::ast::ColumnOption::NotNull => {
+                        Some(Constraint::NotNull)
+                    }
+                    sqlparser::ast::ColumnOption::Unique { is_primary } if *is_primary => {
+                        // PRIMARY KEY 是使用 Unique 变体并带有 is_primary 标志
+                        Some(Constraint::PrimaryKey)
+                    }
+                    _ => None, // 忽略其他约束类型
+                }
+            })
+            .collect();
         schema_columns.push(ColumnDefinition {
             name: column_name,
             data_type,
-            constraints: Vec::new(),
+            constraints,
         });
     }
     let schema = Schema {
@@ -770,5 +791,36 @@ pub mod tests {
             schema_res.is_err(),
             "Table should not exist after DROP TABLE"
         );
+    }
+
+    #[test]
+    fn test_execute_create_table_with_constraints() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        // 测试创建带有 PRIMARY KEY 和 NOT NULL 约束的表
+        let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100) NOT NULL);";
+        let statement = parse_sql_to_statement(sql);
+
+        match execute_stmt(statement, &mut mock_storage) {
+            Ok(QueryResult::Success) => {
+                let schema_result = mock_storage.get_table_schema("users");
+                assert!(schema_result.is_ok());
+                let schema = schema_result.unwrap();
+                
+                // 检查列的数量
+                assert_eq!(schema.columns.len(), 2);
+                
+                // 检查id列的PRIMARY KEY约束
+                assert_eq!(schema.columns[0].name, "id");
+                assert_eq!(schema.columns[0].data_type, StorageDataType::Int(32));
+                assert!(schema.columns[0].constraints.contains(&Constraint::PrimaryKey));
+                
+                // 检查name列的NOT NULL约束
+                assert_eq!(schema.columns[1].name, "name");
+                assert_eq!(schema.columns[1].data_type, StorageDataType::Varchar(100));
+                assert!(schema.columns[1].constraints.contains(&Constraint::NotNull));
+            }
+            Err(e) => panic!("Execution failed: {:?}", e),
+            _ => panic!("Unexpected query result type for CREATE TABLE"),
+        }
     }
 }
