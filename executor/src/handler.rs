@@ -15,6 +15,163 @@ pub enum QueryResult {
     Success, // For statements like CREATE TABLE, INSERT without returning data
 }
 
+impl QueryResult {
+    /// Display query results in a formatted table
+    pub fn display(&self, column_names: Option<&[String]>) {
+        match self {
+            QueryResult::Data(rows) => {
+                if rows.is_empty() {
+                    println!("No rows returned.");
+                    return;
+                }
+                
+                let num_cols = rows[0].values.len();
+                let mut col_widths = vec![0; num_cols];
+                
+                // Default column names if not provided
+                let default_names: Vec<String> = (0..num_cols)
+                    .map(|i| format!("col{}", i + 1))
+                    .collect();
+                let headers = column_names.unwrap_or(&default_names);
+                
+                // Calculate width for headers (minimum 3 characters)
+                for (i, header) in headers.iter().enumerate() {
+                    if i < col_widths.len() {
+                        col_widths[i] = header.len().max(3);
+                    }
+                }
+                
+                // Calculate width for data values (without quotes for strings)
+                for row in rows {
+                    for (i, value) in row.values.iter().enumerate() {
+                        if i < col_widths.len() {
+                            let display_str = match value {
+                                Value::Int(n) => n.to_string(),
+                                Value::Varchar(s) => s.clone(),
+                                Value::Null => "NULL".to_string(),
+                            };
+                            col_widths[i] = col_widths[i].max(display_str.len());
+                        }
+                    }
+                }
+                
+                // Print header row with left alignment and proper spacing
+                print!("|");
+                for (i, header) in headers.iter().enumerate() {
+                    if i < col_widths.len() {
+                        print!(" {:<width$} |", header, width = col_widths[i]);
+                    }
+                }
+                println!();
+                
+                // Print separator row
+                print!("|");
+                for &width in &col_widths {
+                    print!(" {} |", "-".repeat(width));
+                }
+                println!();
+                
+                // Print data rows with left alignment
+                for row in rows {
+                    print!("|");
+                    for (i, value) in row.values.iter().enumerate() {
+                        if i < col_widths.len() {
+                            let display_str = match value {
+                                Value::Int(n) => n.to_string(),
+                                Value::Varchar(s) => s.clone(),
+                                Value::Null => "NULL".to_string(),
+                            };
+                            print!(" {:<width$} |", display_str, width = col_widths[i]);
+                        }
+                    }
+                    println!();
+                }
+            }
+            _ => {
+                // Don't print anything for non-SELECT statements
+            }
+        }
+    }
+    
+    /// Format query results as string for testing
+    pub fn format_as_string(&self, column_names: Option<&[String]>) -> String {
+        match self {
+            QueryResult::Data(rows) => {
+                if rows.is_empty() {
+                    return "No rows returned.".to_string();
+                }
+                
+                let num_cols = rows[0].values.len();
+                let mut col_widths = vec![0; num_cols];
+                
+                // Default column names if not provided
+                let default_names: Vec<String> = (0..num_cols)
+                    .map(|i| format!("col{}", i + 1))
+                    .collect();
+                let headers = column_names.unwrap_or(&default_names);
+                
+                // Calculate width for headers (minimum 3 characters)
+                for (i, header) in headers.iter().enumerate() {
+                    if i < col_widths.len() {
+                        col_widths[i] = header.len().max(3);
+                    }
+                }
+                
+                // Calculate width for data values (without quotes for strings)
+                for row in rows {
+                    for (i, value) in row.values.iter().enumerate() {
+                        if i < col_widths.len() {
+                            let display_str = match value {
+                                Value::Int(n) => n.to_string(),
+                                Value::Varchar(s) => s.clone(),
+                                Value::Null => "NULL".to_string(),
+                            };
+                            col_widths[i] = col_widths[i].max(display_str.len());
+                        }
+                    }
+                }
+                
+                let mut result = String::new();
+                
+                // Header row with left alignment and proper spacing
+                result.push('|');
+                for (i, header) in headers.iter().enumerate() {
+                    if i < col_widths.len() {
+                        result.push_str(&format!(" {:<width$} |", header, width = col_widths[i]));
+                    }
+                }
+                result.push('\n');
+                
+                // Separator row
+                result.push('|');
+                for &width in &col_widths {
+                    result.push_str(&format!(" {} |", "-".repeat(width)));
+                }
+                result.push('\n');
+                
+                // Data rows with left alignment
+                for row in rows {
+                    result.push('|');
+                    for (i, value) in row.values.iter().enumerate() {
+                        if i < col_widths.len() {
+                            let display_str = match value {
+                                Value::Int(n) => n.to_string(),
+                                Value::Varchar(s) => s.clone(),
+                                Value::Null => "NULL".to_string(),
+                            };
+                            result.push_str(&format!(" {:<width$} |", display_str, width = col_widths[i]));
+                        }
+                    }
+                    result.push('\n');
+                }
+                
+                result
+            }
+            _ => String::new(),
+        }
+    }
+}
+
 pub fn execute_stmt(
     statement: Statement,
     storage_engine: &mut dyn StorageEngine,
@@ -47,7 +204,15 @@ fn handle_query_stmt(
     storage_engine: &dyn StorageEngine,
 ) -> Result<QueryResult, ExecutionError> {
     let rows = handle_query(query, storage_engine)?;
-    Ok(QueryResult::Data(rows))
+    let result = QueryResult::Data(rows);
+    
+    // Extract column names from the query for display
+    let column_names = extract_columns_from_select(&query.body).ok();
+    
+    // Print the query results with column names
+    result.display(column_names.as_deref());
+    
+    Ok(result)
 }
 
 fn handle_insert_stmt(
@@ -1093,5 +1258,80 @@ pub mod tests {
                 assert!(false, "SQL解析器应该支持混合注释");
             }
         }
+    }
+
+    #[test]
+    fn test_display_format_matches_expected_automatically() {
+        // Test that our output format exactly matches the expected format from the test case
+        let rows = vec![
+            Row { values: vec![Value::Int(1), Value::Varchar("Science Fiction".to_string())] },
+            Row { values: vec![Value::Int(2), Value::Varchar("Action".to_string())] },
+        ];
+        let result = QueryResult::Data(rows);
+        let column_names = vec!["id".to_string(), "name".to_string()];
+        
+        let actual_output = result.format_as_string(Some(&column_names));
+        // Expected output from the test case file - note the left alignment and proper spacing
+        let expected_output = "| id  | name            |\n| --- | --------------- |\n| 1   | Science Fiction |\n| 2   | Action          |\n";
+        
+        println!("Expected output from test case:");
+        println!("{}", expected_output);
+        println!("Actual output:");
+        println!("{}", actual_output);
+        
+        // Split into lines for easier comparison
+        let actual_lines: Vec<&str> = actual_output.lines().collect();
+        let expected_lines: Vec<&str> = expected_output.lines().collect();
+        
+        // Check line by line
+        assert_eq!(actual_lines.len(), expected_lines.len(), "Number of output lines should match");
+        
+        for (i, (actual, expected)) in actual_lines.iter().zip(expected_lines.iter()).enumerate() {
+            assert_eq!(actual, expected, "Line {} should match. Expected: '{}', Actual: '{}'", i + 1, expected, actual);
+        }
+    }
+
+    #[test]
+    fn test_display_format_with_different_column_widths() {
+        // Test case with varying column widths
+        let rows = vec![
+            Row { values: vec![Value::Int(1), Value::Varchar("Science Fiction".to_string())] },
+            Row { values: vec![Value::Int(2), Value::Varchar("Action".to_string())] },
+        ];
+        let result = QueryResult::Data(rows);
+        let column_names = vec!["id".to_string(), "name".to_string()];
+        
+        let output = result.format_as_string(Some(&column_names));
+        
+        // Check that columns are properly formatted with left alignment
+        assert!(output.contains("| id  | name            |"), "Header should have correct left-aligned spacing");
+        assert!(output.contains("| --- | --------------- |"), "Separator should match column widths");
+        assert!(output.contains("| 1   | Science Fiction |"), "Data should be left-aligned");
+        assert!(output.contains("| 2   | Action          |"), "Data should be left-aligned");
+        
+        println!("Output with different column widths:");
+        println!("{}", output);
+    }
+
+    #[test]
+    fn test_display_format_minimum_width() {
+        // Test that columns have minimum width of 3 characters
+        let rows = vec![
+            Row { values: vec![Value::Int(1), Value::Varchar("A".to_string())] },
+            Row { values: vec![Value::Int(2), Value::Varchar("B".to_string())] },
+        ];
+        let result = QueryResult::Data(rows);
+        let column_names = vec!["a".to_string(), "b".to_string()];
+        
+        let output = result.format_as_string(Some(&column_names));
+        
+        // Both columns should have minimum width of 3
+        assert!(output.contains("| a   | b   |"), "Both columns should have minimum width of 3");
+        assert!(output.contains("| --- | --- |"), "Separators should be 3 dashes each");
+        assert!(output.contains("| 1   | A   |"), "Data should be left-aligned with padding");
+        assert!(output.contains("| 2   | B   |"), "Data should be left-aligned with padding");
+        
+        println!("Output with minimum width:");
+        println!("{}", output);
     }
 }
