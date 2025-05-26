@@ -573,14 +573,256 @@ fn handle_query(
         }
     }
     
-    // Regular table query
+    // Regular table query - now with enhanced handling for expressions and compound conditions
     let table_name = extract_table_name(query_body_ref)?;
-    let columns = extract_columns_from_select(query_body_ref)?;
     let condition = extract_condition_from_select(query_body_ref)?;
 
-    storage_engine
-        .select_rows(&table_name, columns, condition)
-        .map_err(ExecutionError::StorageError)
+    // Check if we have expressions in the projection
+    let has_expressions = if let SetExpr::Select(select_expr) = query_body_ref {
+        select_expr.projection.iter().any(|item| {
+            matches!(item, SelectItem::UnnamedExpr(expr) if !matches!(expr, Expr::Identifier(_)))
+        })
+    } else {
+        false
+    };
+
+    // If we have expressions, we need to get all columns first, then apply projection
+    let columns_to_fetch = if has_expressions {
+        // Get all columns from table schema
+        let schema = storage_engine
+            .get_table_schema(&table_name)
+            .map_err(ExecutionError::StorageError)?;
+        schema.columns.iter().map(|col| col.name.clone()).collect()
+    } else {
+        // Use the original column extraction logic for simple projections
+        extract_columns_from_select(query_body_ref)?
+    };
+
+    // Get all rows that match the basic condition (or all rows if no condition)
+    let initial_rows = storage_engine
+        .select_rows(&table_name, columns_to_fetch, condition)
+        .map_err(ExecutionError::StorageError)?;
+
+    // Now handle compound conditions and expression evaluation
+    if let SetExpr::Select(select_expr) = query_body_ref {
+        // Apply compound condition filtering if needed
+        let filtered_rows = if let Some(selection_expr) = &select_expr.selection {
+            filter_rows_with_compound_conditions(&initial_rows, selection_expr, &table_name, storage_engine)?
+        } else {
+            initial_rows
+        };
+
+        // Apply expression evaluation in projection
+        evaluate_projection_expressions(&filtered_rows, &select_expr.projection, &table_name, storage_engine)
+    } else {
+        Ok(initial_rows)
+    }
+}
+
+/// Filter rows based on compound conditions (AND/OR)
+fn filter_rows_with_compound_conditions(
+    rows: &[Row],
+    condition_expr: &Expr,
+    table_name: &str,
+    storage_engine: &dyn StorageEngine,
+) -> Result<Vec<Row>, ExecutionError> {
+    let table_schema = storage_engine
+        .get_table_schema(table_name)
+        .map_err(ExecutionError::StorageError)?;
+
+    let mut filtered_rows = Vec::new();
+
+    for row in rows {
+        if evaluate_condition_on_row(condition_expr, row, &table_schema)? {
+            filtered_rows.push(row.clone());
+        }
+    }
+
+    Ok(filtered_rows)
+}
+
+/// Evaluate a condition expression on a single row
+fn evaluate_condition_on_row(
+    expr: &Expr,
+    row: &Row,
+    schema: &storage::storage_engine_interface::Schema,
+) -> Result<bool, ExecutionError> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinaryOperator::And => {
+                    let left_result = evaluate_condition_on_row(left, row, schema)?;
+                    let right_result = evaluate_condition_on_row(right, row, schema)?;
+                    Ok(left_result && right_result)
+                }
+                BinaryOperator::Or => {
+                    let left_result = evaluate_condition_on_row(left, row, schema)?;
+                    let right_result = evaluate_condition_on_row(right, row, schema)?;
+                    Ok(left_result || right_result)
+                }
+                BinaryOperator::Eq | BinaryOperator::Lt | BinaryOperator::Gt => {
+                    evaluate_simple_condition_on_row(left, op, right, row, schema)
+                }
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
+    }
+}
+
+/// Evaluate a simple condition (col op value) on a single row
+fn evaluate_simple_condition_on_row(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    row: &Row,
+    schema: &storage::storage_engine_interface::Schema,
+) -> Result<bool, ExecutionError> {
+    // Get column name from left side
+    let column_name = match left {
+        Expr::Identifier(ident) => &ident.value,
+        _ => return Err(ExecutionError::UnsupportedStatement),
+    };
+
+    // Find column index in schema
+    let column_index = schema
+        .columns
+        .iter()
+        .position(|col| &col.name == column_name)
+        .ok_or_else(|| ExecutionError::StorageError(format!("Column {} not found", column_name)))?;
+
+    // Get the value from the row
+    let row_value = row.values.get(column_index)
+        .ok_or_else(|| ExecutionError::StorageError("Row value index out of bounds".to_string()))?;
+
+    // Get the comparison value from right side
+    let comparison_value = match right {
+        Expr::Value(sqlparser::ast::Value::Number(s, _)) => {
+            s.parse::<i32>()
+                .map(Value::Int)
+                .map_err(|_| ExecutionError::SyntaxError)?
+        }
+        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+            Value::Varchar(s.clone())
+        }
+        _ => return Err(ExecutionError::UnsupportedStatement),
+    };
+
+    // Perform the comparison
+    match op {
+        BinaryOperator::Eq => Ok(row_value == &comparison_value),
+        BinaryOperator::Lt => {
+            match (row_value, &comparison_value) {
+                (Value::Int(a), Value::Int(b)) => Ok(a < b),
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        BinaryOperator::Gt => {
+            match (row_value, &comparison_value) {
+                (Value::Int(a), Value::Int(b)) => Ok(a > b),
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
+    }
+}
+
+/// Evaluate expressions in the SELECT projection
+fn evaluate_projection_expressions(
+    rows: &[Row],
+    projection: &[SelectItem],
+    table_name: &str,
+    storage_engine: &dyn StorageEngine,
+) -> Result<Vec<Row>, ExecutionError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let table_schema = storage_engine
+        .get_table_schema(table_name)
+        .map_err(ExecutionError::StorageError)?;
+
+    let mut result_rows = Vec::new();
+
+    for row in rows {
+        let mut new_row_values = Vec::new();
+
+        for item in projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    let value = evaluate_expression_with_row_context(expr, row, &table_schema)?;
+                    new_row_values.push(value);
+                }
+                SelectItem::Wildcard => {
+                    // For wildcard, include all values from the original row
+                    new_row_values.extend(row.values.clone());
+                }
+                _ => return Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+
+        result_rows.push(Row { values: new_row_values });
+    }
+
+    Ok(result_rows)
+}
+
+/// Evaluate an expression in the context of a specific row
+fn evaluate_expression_with_row_context(
+    expr: &Expr,
+    row: &Row,
+    schema: &storage::storage_engine_interface::Schema,
+) -> Result<Value, ExecutionError> {
+    match expr {
+        Expr::Value(sqlparser::ast::Value::Number(s, _)) => {
+            s.parse::<i32>()
+                .map(Value::Int)
+                .map_err(|_| ExecutionError::SyntaxError)
+        }
+        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+            Ok(Value::Varchar(s.clone()))
+        }
+        Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => {
+            Ok(Value::Varchar(s.clone()))
+        }
+        Expr::Identifier(ident) => {
+            // Look up the column value from the row
+            let column_name = &ident.value;
+            let column_index = schema
+                .columns
+                .iter()
+                .position(|col| &col.name == column_name)
+                .ok_or_else(|| ExecutionError::StorageError(format!("Column {} not found", column_name)))?;
+
+            row.values.get(column_index)
+                .cloned()
+                .ok_or_else(|| ExecutionError::StorageError("Row value index out of bounds".to_string()))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = evaluate_expression_with_row_context(left, row, schema)?;
+            let right_val = evaluate_expression_with_row_context(right, row, schema)?;
+            
+            match (left_val, right_val) {
+                (Value::Int(a), Value::Int(b)) => {
+                    match op {
+                        BinaryOperator::Plus => Ok(Value::Int(a + b)),
+                        BinaryOperator::Minus => Ok(Value::Int(a - b)),
+                        BinaryOperator::Multiply => Ok(Value::Int(a * b)),
+                        BinaryOperator::Divide => {
+                            if b == 0 {
+                                Err(ExecutionError::SyntaxError) // Division by zero
+                            } else {
+                                Ok(Value::Int(a / b))
+                            }
+                        }
+                        _ => Err(ExecutionError::UnsupportedStatement),
+                    }
+                }
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
+    }
 }
 
 /// Handle SELECT queries without FROM clause (expression evaluation)
@@ -805,53 +1047,69 @@ fn extract_condition_from_select(
         SetExpr::Select(select_expr) => {
             match &select_expr.selection {
                 Some(expr) => {
-                    match expr {
-                        Expr::BinaryOp { left, op, right } => {
-                            let left_col = match left.as_ref() {
-                                Expr::Identifier(ident) => ident.value.clone(),
-                                _ => return Err(ExecutionError::UnsupportedStatement),
-                            };
-
-                            let value_expr = match right.as_ref() {
-                                Expr::Value(v) => v,
-                                _ => return Err(ExecutionError::UnsupportedStatement), // Only support direct value comparison for now
-                            };
-
-                            let parsed_value = match value_expr {
-                                sqlparser::ast::Value::Number(s, _l) => s
-                                    .parse::<i32>()
-                                    .map(Value::Int)
-                                    .map_err(|_| ExecutionError::SyntaxError)?,
-                                sqlparser::ast::Value::SingleQuotedString(s) => {
-                                    Value::Varchar(s.clone())
-                                }
-                                sqlparser::ast::Value::Boolean(b) => Value::Varchar(b.to_string()),
-                                // TODO: Handle other sqlparser::ast::Value variants
-                                _ => return Err(ExecutionError::UnsupportedStatement),
-                            };
-
-                            match op {
-                                BinaryOperator::Eq => {
-                                    Ok(Some(Condition::Equals(left_col, parsed_value)))
-                                }
-                                BinaryOperator::Gt => {
-                                    Ok(Some(Condition::GreaterThan(left_col, parsed_value)))
-                                }
-                                BinaryOperator::Lt => {
-                                    Ok(Some(Condition::LessThan(left_col, parsed_value)))
-                                }
-                                // TODO: Handle other operators like Ne, GtEq, LtEq, And, Or
-                                _ => Err(ExecutionError::UnsupportedStatement),
-                            }
-                        }
-                        // TODO: Handle other condition expressions
-                        _ => Ok(None), // No condition or unsupported condition type
-                    }
+                    extract_simple_condition_from_expr(expr)
                 }
                 None => Ok(None), // No WHERE clause
             }
         }
         _ => Err(ExecutionError::UnsupportedStatement),
+    }
+}
+
+/// Extract a simple condition from an expression
+/// For compound conditions (AND/OR), returns the first simple condition and handles the rest during execution
+fn extract_simple_condition_from_expr(expr: &Expr) -> Result<Option<Condition>, ExecutionError> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinaryOperator::And | BinaryOperator::Or => {
+                    // For compound conditions, extract the first simple condition
+                    // The compound logic will be handled in the modified query execution
+                    extract_simple_condition_from_expr(left)
+                }
+                _ => {
+                    // Simple binary operation like col = value, col > value, etc.
+                    let left_col = match left.as_ref() {
+                        Expr::Identifier(ident) => ident.value.clone(),
+                        _ => return Err(ExecutionError::UnsupportedStatement),
+                    };
+
+                    let value_expr = match right.as_ref() {
+                        Expr::Value(v) => v,
+                        _ => return Err(ExecutionError::UnsupportedStatement), // Only support direct value comparison for now
+                    };
+
+                    let parsed_value = match value_expr {
+                        sqlparser::ast::Value::Number(s, _l) => s
+                            .parse::<i32>()
+                            .map(Value::Int)
+                            .map_err(|_| ExecutionError::SyntaxError)?,
+                        sqlparser::ast::Value::SingleQuotedString(s) => {
+                            Value::Varchar(s.clone())
+                        }
+                        sqlparser::ast::Value::Boolean(b) => Value::Varchar(b.to_string()),
+                        // TODO: Handle other sqlparser::ast::Value variants
+                        _ => return Err(ExecutionError::UnsupportedStatement),
+                    };
+
+                    match op {
+                        BinaryOperator::Eq => {
+                            Ok(Some(Condition::Equals(left_col, parsed_value)))
+                        }
+                        BinaryOperator::Gt => {
+                            Ok(Some(Condition::GreaterThan(left_col, parsed_value)))
+                        }
+                        BinaryOperator::Lt => {
+                            Ok(Some(Condition::LessThan(left_col, parsed_value)))
+                        }
+                        // TODO: Handle other operators like Ne, GtEq, LtEq
+                        _ => Err(ExecutionError::UnsupportedStatement),
+                    }
+                }
+            }
+        }
+        // TODO: Handle other condition expressions
+        _ => Ok(None), // No condition or unsupported condition type
     }
 }
 
@@ -934,7 +1192,7 @@ fn format_expression_as_column_name(expr: &Expr) -> String {
                 BinaryOperator::Divide => "/",
                 _ => "?",
             };
-            format!("{} {} {}", left_str, op_str, right_str)
+            format!("{}{}{}", left_str, op_str, right_str)
         }
         Expr::Identifier(ident) => ident.value.clone(),
         _ => "expr".to_string(),
