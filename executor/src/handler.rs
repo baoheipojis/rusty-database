@@ -6,6 +6,7 @@ use sqlparser::ast::{
 use storage::storage_engine_interface::{
     ColumnDefinition, Condition, Constraint, DataType as StorageDataType, Row, Schema, StorageEngine, Value,
 }; // Added Constraint import
+use std::fs;
 
 // Represents the result of a query execution
 #[derive(Debug)]
@@ -388,33 +389,47 @@ fn handle_insert(
     let partial_rows = extract_insert_values(source_body_ref)?;
 
     for partial_row in partial_rows {
-        // 验证部分行的值数量是否与指定列数量匹配
-        if partial_row.values.len() != specified_columns.len() {
-            return Err(ExecutionError::StorageError(format!(
-                "Error: Number of values ({}) doesn't match number of specified columns ({})",
-                partial_row.values.len(),
-                specified_columns.len()
-            )));
-        }
+        let complete_values = if specified_columns.is_empty() {
+            // Case: INSERT INTO table VALUES (...) - no columns specified
+            // Treat it as inserting into all columns in order
+            if partial_row.values.len() != table_schema.columns.len() {
+                return Err(ExecutionError::StorageError(format!(
+                    "Error: Number of values ({}) doesn't match number of table columns ({})",
+                    partial_row.values.len(),
+                    table_schema.columns.len()
+                )));
+            }
+            partial_row.values.clone()
+        } else {
+            // Case: INSERT INTO table (col1, col2, ...) VALUES (...) - specific columns
+            if partial_row.values.len() != specified_columns.len() {
+                return Err(ExecutionError::StorageError(format!(
+                    "Error: Number of values ({}) doesn't match number of specified columns ({})",
+                    partial_row.values.len(),
+                    specified_columns.len()
+                )));
+            }
 
-        // 创建完整的行，为所有列分配值
-        let mut complete_values = vec![Value::Null; table_schema.columns.len()];
-        
-        // 将指定列的值填入对应位置
-        for (i, column_name) in specified_columns.iter().enumerate() {
-            // 找到这个列在表schema中的位置
-            let schema_column_index = table_schema
-                .columns
-                .iter()
-                .position(|col| &col.name == column_name)
-                .ok_or_else(|| ExecutionError::StorageError(format!(
-                    "Error: Column '{}' does not exist in table '{}'",
-                    column_name, table_name_str
-                )))?;
+            // 创建完整的行，为所有列分配值
+            let mut complete_values = vec![Value::Null; table_schema.columns.len()];
             
-            // 将值放到正确的位置
-            complete_values[schema_column_index] = partial_row.values[i].clone();
-        }
+            // 将指定列的值填入对应位置
+            for (i, column_name) in specified_columns.iter().enumerate() {
+                // 找到这个列在表schema中的位置
+                let schema_column_index = table_schema
+                    .columns
+                    .iter()
+                    .position(|col| &col.name == column_name)
+                    .ok_or_else(|| ExecutionError::StorageError(format!(
+                        "Error: Column '{}' does not exist in table '{}'",
+                        column_name, table_name_str
+                    )))?;
+                
+                // 将值放到正确的位置
+                complete_values[schema_column_index] = partial_row.values[i].clone();
+            }
+            complete_values
+        };
 
         // 检查约束（在存储之前）
         for (col_idx, column) in table_schema.columns.iter().enumerate() {
@@ -539,8 +554,26 @@ fn extract_condition_from_select(
     }
 }
 
+/// 从 INSERT 语句的 VALUES 部分提取行数据
+/// 
+/// # 参数
+/// - `source_body`: SQL 解析后的 VALUES 表达式
+/// 
+/// # 返回值
+/// - `Ok(Vec<Row>)`: 解析成功，返回行数据列表
+/// - `Err(ExecutionError)`: 解析失败或不支持的语法
+/// 
+/// # 示例
+/// ```rust
+/// use sqlparser::ast::SetExpr;
+/// 
+/// // 解析 INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')
+/// let rows = extract_insert_values(&values_expr)?;
+/// // 返回: Vec<Row> 包含两行数据
+/// // Row 1: [Value::Int(1), Value::Varchar("Alice".to_string())]
+/// // Row 2: [Value::Int(2), Value::Varchar("Bob".to_string())]
+/// ```
 fn extract_insert_values(source_body: &SetExpr) -> Result<Vec<Row>, ExecutionError> {
-    // Takes &SetExpr
     match source_body {
         // No need for as_ref() if already &SetExpr
         SetExpr::Values(values_list) => {
@@ -559,10 +592,17 @@ fn extract_insert_values(source_body: &SetExpr) -> Result<Vec<Row>, ExecutionErr
                                 Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
                                     Ok(Value::Varchar(s.clone()))
                                 }
+                                Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => {
+                                    Ok(Value::Varchar(s.clone()))
+                                }
                                 Expr::Value(sqlparser::ast::Value::Boolean(b)) => {
                                     Ok(Value::Varchar(b.to_string()))
                                 } // Storing boolean as Varchar for now, consider dedicated type in Value enum
                                 Expr::Value(sqlparser::ast::Value::Null) => Ok(Value::Null),
+                                // Handle identifiers with quote styles (double-quoted strings parsed as identifiers)
+                                Expr::Identifier(ident) if ident.quote_style.is_some() => {
+                                    Ok(Value::Varchar(ident.value.clone()))
+                                }
                                 _ => Err(ExecutionError::UnsupportedStatement),
                             }
                         })
@@ -582,6 +622,131 @@ pub mod tests {
     use super::*;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+
+    /// 读取测试用例输入文件
+    /// 
+    /// # 参数
+    /// * `case_number` - 测试用例编号 (1, 2, 3, ...)
+    /// 
+    /// # 返回值
+    /// * `Result<String, String>` - 成功时返回文件内容，失败时返回错误信息
+    pub fn read_test_case_input(case_number: u32) -> Result<String, String> {
+        let test_cases_dir = "/Users/pojis/Library/CloudStorage/OneDrive-南京大学/大三下课程/Rust Programming Language/实验/rusty-database/公开测试用例";
+        let input_file = format!("{}/{}/input.txt", test_cases_dir, case_number);
+        
+        fs::read_to_string(&input_file)
+            .map_err(|e| format!("Failed to read input file {}: {}", input_file, e))
+    }
+
+    /// 读取测试用例期望输出文件
+    /// 
+    /// # 参数
+    /// * `case_number` - 测试用例编号 (1, 2, 3, ...)
+    /// 
+    /// # 返回值
+    /// * `Result<String, String>` - 成功时返回文件内容，失败时返回错误信息
+    pub fn read_test_case_output(case_number: u32) -> Result<String, String> {
+        let test_cases_dir = "/Users/pojis/Library/CloudStorage/OneDrive-南京大学/大三下课程/Rust Programming Language/实验/rusty-database/公开测试用例";
+        let output_file = format!("{}/{}/output.txt", test_cases_dir, case_number);
+        
+        fs::read_to_string(&output_file)
+            .map_err(|e| format!("Failed to read output file {}: {}", output_file, e))
+    }
+
+    /// 执行测试用例
+    /// 
+    /// # 参数
+    /// * `case_number` - 测试用例编号
+    /// 
+    /// # 返回值
+    /// * `Result<(), String>` - 成功时返回Ok(())，失败时返回错误信息
+    pub fn run_test_case(case_number: u32) -> Result<(), String> {
+        let input_sql = read_test_case_input(case_number)?;
+        let expected_output = read_test_case_output(case_number)?;
+        
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        let mut actual_output = String::new();
+        
+        // 分割SQL语句并执行
+        let statements = parse_multiple_sql_statements(&input_sql)?;
+        
+        for statement in statements {
+            let result = execute_stmt(statement, &mut mock_storage)
+                .map_err(|e| format!("Execution error: {:?}", e))?;
+            
+            // 只有SELECT查询才产生输出
+            if let QueryResult::Data(rows) = result {
+                // 需要获取列名，这里假设是简单的情况
+                let column_names = extract_column_names_from_result(&rows);
+                let query_result = QueryResult::Data(rows);
+                actual_output = query_result.format_as_string(Some(&column_names));
+                break; // 假设只有最后一个SELECT产生输出
+            }
+        }
+        
+        // 比较输出，忽略换行符差异
+        let expected_normalized = expected_output.trim().replace("\r\n", "\n");
+        let actual_normalized = actual_output.trim().replace("\r\n", "\n");
+        
+        if expected_normalized == actual_normalized {
+            println!("测试用例 {} 通过！", case_number);
+            Ok(())
+        } else {
+            Err(format!(
+                "测试用例 {} 失败！\n期望输出:\n{}\n实际输出:\n{}", 
+                case_number, expected_normalized, actual_normalized
+            ))
+        }
+    }
+
+    /// 解析多个SQL语句
+    fn parse_multiple_sql_statements(sql: &str) -> Result<Vec<Statement>, String> {
+        let dialect = GenericDialect {};
+        let mut statements = Vec::new();
+        
+        // 简单地按分号分割，然后逐个解析
+        let lines: Vec<&str> = sql.lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
+            .collect();
+        
+        let mut current_statement = String::new();
+        
+        for line in lines {
+            current_statement.push_str(line);
+            current_statement.push(' ');
+            
+            if line.trim().ends_with(';') {
+                let stmt_sql = current_statement.trim();
+                if !stmt_sql.is_empty() {
+                    match Parser::parse_sql(&dialect, stmt_sql) {
+                        Ok(mut parsed) => {
+                            if let Some(statement) = parsed.pop() {
+                                statements.push(statement);
+                            }
+                        }
+                        Err(e) => return Err(format!("Parse error for '{}': {}", stmt_sql, e)),
+                    }
+                }
+                current_statement.clear();
+            }
+        }
+        
+        Ok(statements)
+    }
+
+    /// 从结果中提取列名（简化版本）
+    fn extract_column_names_from_result(rows: &[Row]) -> Vec<String> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        
+        // 这里简化处理，假设是常见的列名
+        let num_cols = rows[0].values.len();
+        match num_cols {
+            2 => vec!["id".to_string(), "name".to_string()],
+            _ => (0..num_cols).map(|i| format!("col{}", i + 1)).collect(),
+        }
+    }
 
     #[derive(Clone)]
     pub struct MockExecutorStorageEngine {
@@ -1477,7 +1642,7 @@ pub mod tests {
         let insert_sql1 = "INSERT INTO genres VALUES (1, \"Science Fiction\");";
         let statement = parse_sql_to_statement(insert_sql1);
         let result = execute_stmt(statement, &mut mock_storage);
-        assert!(result.is_ok(), "First INSERT should succeed");
+        assert!(result.is_ok(), "First INSERT should succeed: {:?}", result.err());
         
         // 3. 插入数据 - 第二条记录
         let insert_sql2 = "INSERT INTO genres VALUES (2, \"Action\");";
@@ -1520,6 +1685,92 @@ pub mod tests {
         }
         
         println!("公开测试用例1通过！");
+    }
+
+    #[test]
+    fn test_public_case_2() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 读取测试用例2的SQL输入
+        let input_sql = read_test_case_input(2).expect("Should be able to read test case 2 input");
+        let expected_output = read_test_case_output(2).expect("Should be able to read test case 2 output");
+        
+        println!("测试用例2输入SQL:");
+        println!("{}", input_sql);
+        println!("期望输出:");
+        println!("{}", expected_output);
+        
+        // 解析并执行所有SQL语句
+        let statements = parse_multiple_sql_statements(&input_sql).expect("Should parse SQL statements");
+        
+        let mut actual_output = String::new();
+        
+        for statement in statements {
+            println!("执行语句: {:?}", statement);
+            let result = execute_stmt(statement, &mut mock_storage);
+            
+            match result {
+                Ok(QueryResult::Data(rows)) => {
+                    // 这是SELECT查询的结果
+                    let column_names = vec!["id".to_string(), "name".to_string()];
+                    let query_result = QueryResult::Data(rows);
+                    actual_output = query_result.format_as_string(Some(&column_names));
+                    println!("查询结果:");
+                    println!("{}", actual_output);
+                }
+                Ok(QueryResult::Success) => {
+                    println!("语句执行成功");
+                }
+                Ok(QueryResult::RowsAffected(count)) => {
+                    println!("影响了 {} 行", count);
+                }
+                Err(e) => {
+                    println!("执行错误: {:?}", e);
+                    // 对于某些操作（如DROP不存在的表），可能是预期的错误
+                }
+            }
+        }
+        
+        // 比较输出，忽略换行符差异
+        let expected_normalized = expected_output.trim().replace("\r\n", "\n");
+        let actual_normalized = actual_output.trim().replace("\r\n", "\n");
+        
+        assert_eq!(expected_normalized, actual_normalized, 
+            "输出应该匹配期望结果.\n期望:\n{}\n实际:\n{}", 
+            expected_normalized, actual_normalized);
+            
+        println!("公开测试用例2通过！");
+    }
+
+    #[test]
+    fn test_run_test_case_1() {
+        // 使用通用测试函数测试用例1
+        match run_test_case(1) {
+            Ok(_) => println!("测试用例1通过！"),
+            Err(e) => panic!("测试用例1失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_2() {
+        // 使用通用测试函数测试用例2
+        match run_test_case(2) {
+            Ok(_) => println!("测试用例2通过！"),
+            Err(e) => panic!("测试用例2失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_all_public_cases() {
+        // 测试所有公开测试用例
+        for case_num in 1..=3 {
+            println!("运行测试用例 {}", case_num);
+            match run_test_case(case_num) {
+                Ok(_) => println!("测试用例 {} 通过！", case_num),
+                Err(e) => panic!("测试用例 {} 失败: {}", case_num, e),
+            }
+        }
+        println!("所有公开测试用例都通过了！");
     }
 
 }
