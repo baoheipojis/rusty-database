@@ -612,8 +612,12 @@ fn handle_query(
             initial_rows
         };
 
-        // Apply expression evaluation in projection
-        evaluate_projection_expressions(&filtered_rows, &select_expr.projection, &table_name, storage_engine)
+        // Apply expression evaluation in projection only if we have expressions
+        if has_expressions {
+            evaluate_projection_expressions(&filtered_rows, &select_expr.projection, &table_name, storage_engine)
+        } else {
+            Ok(filtered_rows)
+        }
     } else {
         Ok(initial_rows)
     }
