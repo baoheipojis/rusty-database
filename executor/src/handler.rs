@@ -197,6 +197,12 @@ pub fn execute_stmt(
             names,
             ..
         } => handle_drop_table_stmt(&object_type, if_exists, &names, storage_engine),
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => handle_update_stmt(&table, &assignments, selection.as_ref(), storage_engine),
         _ => Err(ExecutionError::UnsupportedStatement),
     }
 }
@@ -329,6 +335,101 @@ fn handle_drop_table_stmt(
     } else {
         Err(ExecutionError::UnsupportedStatement)
     }
+}
+
+fn handle_update_stmt(
+    table: &sqlparser::ast::TableWithJoins,
+    assignments: &[sqlparser::ast::Assignment],
+    selection: Option<&Expr>,
+    storage_engine: &mut dyn StorageEngine,
+) -> Result<QueryResult, ExecutionError> {
+    // Extract table name from TableWithJoins
+    let table_name = match &table.relation {
+        TableFactor::Table { name, .. } => {
+            name.0.get(0)
+                .map(|ident| ident.value.clone())
+                .ok_or(ExecutionError::SyntaxError)?
+        }
+        _ => return Err(ExecutionError::UnsupportedStatement),
+    };
+
+    // Extract assignments (SET clauses)
+    let mut updates = Vec::new();
+    for assignment in assignments {
+        // assignment.id is a Vec<Ident>, so we need to take the first element
+        let column_name = if let Some(ident) = assignment.id.first() {
+            ident.value.clone()
+        } else {
+            return Err(ExecutionError::SyntaxError);
+        };
+        
+        let new_value = match &assignment.value {
+            Expr::Value(sqlparser::ast::Value::Number(s, _)) => {
+                s.parse::<i32>()
+                    .map(Value::Int)
+                    .map_err(|_| ExecutionError::SyntaxError)?
+            }
+            Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                Value::Varchar(s.clone())
+            }
+            Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => {
+                Value::Varchar(s.clone())
+            }
+            Expr::Value(sqlparser::ast::Value::Null) => Value::Null,
+            _ => return Err(ExecutionError::UnsupportedStatement),
+        };
+        
+        updates.push((column_name, new_value));
+    }
+
+    // Extract WHERE condition if present
+    let condition = if let Some(where_expr) = selection {
+        match where_expr {
+            Expr::BinaryOp { left, op, right } => {
+                let left_col = match left.as_ref() {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                };
+
+                let value_expr = match right.as_ref() {
+                    Expr::Value(v) => v,
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                };
+
+                let parsed_value = match value_expr {
+                    sqlparser::ast::Value::Number(s, _) => s
+                        .parse::<i32>()
+                        .map(Value::Int)
+                        .map_err(|_| ExecutionError::SyntaxError)?,
+                    sqlparser::ast::Value::SingleQuotedString(s) => {
+                        Value::Varchar(s.clone())
+                    }
+                    sqlparser::ast::Value::DoubleQuotedString(s) => {
+                        Value::Varchar(s.clone())
+                    }
+                    sqlparser::ast::Value::Boolean(b) => Value::Varchar(b.to_string()),
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                };
+
+                match op {
+                    BinaryOperator::Eq => Some(Condition::Equals(left_col, parsed_value)),
+                    BinaryOperator::Gt => Some(Condition::GreaterThan(left_col, parsed_value)),
+                    BinaryOperator::Lt => Some(Condition::LessThan(left_col, parsed_value)),
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                }
+            }
+            _ => return Err(ExecutionError::UnsupportedStatement),
+        }
+    } else {
+        None
+    };
+
+    // Execute the update
+    let rows_affected = storage_engine
+        .update_rows(&table_name, updates, condition)
+        .map_err(ExecutionError::StorageError)?;
+    
+    Ok(QueryResult::RowsAffected(rows_affected))
 }
 
 fn handle_query(
@@ -759,7 +860,7 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
     input_sql: &str,
     storage_engine: &mut T
 ) -> Result<String, String> {
-    let mut actual_output = String::new();
+    let mut all_outputs = Vec::new();
     
     // 分割SQL语句并执行
     let statements = parse_multiple_sql_statements(input_sql)?;
@@ -779,12 +880,13 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
         if let QueryResult::Data(rows) = result {
             let cols = column_names.unwrap_or_else(|| extract_column_names_from_result(&rows));
             let query_result = QueryResult::Data(rows);
-            actual_output = query_result.format_as_string(Some(&cols));
-            break; // 假设只有最后一个SELECT产生输出
+            let output = query_result.format_as_string(Some(&cols));
+            all_outputs.push(output);
         }
     }
     
-    Ok(actual_output)
+    // 连接所有输出，用换行符分隔
+    Ok(all_outputs.join("\n"))
 }
 
 /// 执行测试用例
@@ -883,11 +985,68 @@ pub mod tests {
 
         fn update_rows(
             &mut self,
-            _table_name: &str,
-            _updates: Vec<(String, Value)>,
-            _condition: Option<Condition>,
+            table_name: &str,
+            updates: Vec<(String, Value)>,
+            condition: Option<Condition>,
         ) -> Result<u64, String> {
-            unimplemented!()
+            match self.tables.get_mut(table_name) {
+                Some((schema, rows)) => {
+                    let mut rows_affected = 0u64;
+                    
+                    for row in rows.iter_mut() {
+                        // Check if row matches condition
+                        let matches_condition = if let Some(cond) = &condition {
+                            match cond {
+                                Condition::Equals(col_name, expected_val) => {
+                                    if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                        &row.values[col_idx] == expected_val
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Condition::GreaterThan(col_name, expected_val) => {
+                                    if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                        match (&row.values[col_idx], expected_val) {
+                                            (Value::Int(a), Value::Int(e)) => a > e,
+                                            (Value::Varchar(a), Value::Varchar(e)) => a > e,
+                                            _ => false,
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Condition::LessThan(col_name, expected_val) => {
+                                    if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                        match (&row.values[col_idx], expected_val) {
+                                            (Value::Int(a), Value::Int(e)) => a < e,
+                                            (Value::Varchar(a), Value::Varchar(e)) => a < e,
+                                            _ => false,
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            true // No condition means update all rows
+                        };
+                        
+                        if matches_condition {
+                            // Apply updates to this row
+                            for (update_col_name, new_value) in &updates {
+                                if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == update_col_name) {
+                                    row.values[col_idx] = new_value.clone();
+                                }
+                            }
+                            rows_affected += 1;
+                        }
+                    }
+                    
+                    Ok(rows_affected)
+                }
+                None => Err(format!("Table {} not found", table_name)),
+            }
         }
 
         fn delete_rows(
@@ -1861,6 +2020,113 @@ pub mod tests {
         }
     }
 
+    #[test]
+    fn test_run_test_case_4() {
+        // 使用通用测试函数测试用例4
+        match run_test_case(4) {
+            Ok(_) => println!("测试用例4通过！"),
+            Err(e) => panic!("测试用例4失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_5() {
+        // 使用通用测试函数测试用例5
+        match run_test_case(5) {
+            Ok(_) => println!("测试用例5通过！"),
+            Err(e) => panic!("测试用例5失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_6() {
+        // 使用通用测试函数测试用例6
+        match run_test_case(6) {
+            Ok(_) => println!("测试用例6通过！"),
+            Err(e) => panic!("测试用例6失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_7() {
+        // 使用通用测试函数测试用例7
+        match run_test_case(7) {
+            Ok(_) => println!("测试用例7通过！"),
+            Err(e) => panic!("测试用例7失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_8() {
+        // 使用通用测试函数测试用例8
+        match run_test_case(8) {
+            Ok(_) => println!("测试用例8通过！"),
+            Err(e) => panic!("测试用例8失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_10() {
+        // 使用通用测试函数测试用例10
+        match run_test_case(10) {
+            Ok(_) => println!("测试用例10通过！"),
+            Err(e) => panic!("测试用例10失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_11() {
+        // 使用通用测试函数测试用例11
+        match run_test_case(11) {
+            Ok(_) => println!("测试用例11通过！"),
+            Err(e) => panic!("测试用例11失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_12() {
+        // 使用通用测试函数测试用例12
+        match run_test_case(12) {
+            Ok(_) => println!("测试用例12通过！"),
+            Err(e) => panic!("测试用例12失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_13() {
+        // 使用通用测试函数测试用例13
+        match run_test_case(13) {
+            Ok(_) => println!("测试用例13通过！"),
+            Err(e) => panic!("测试用例13失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_14() {
+        // 使用通用测试函数测试用例14
+        match run_test_case(14) {
+            Ok(_) => println!("测试用例14通过！"),
+            Err(e) => panic!("测试用例14失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_15() {
+        // 使用通用测试函数测试用例15
+        match run_test_case(15) {
+            Ok(_) => println!("测试用例15通过！"),
+            Err(e) => panic!("测试用例15失败: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_run_test_case_18() {
+        // 使用通用测试函数测试用例18
+        match run_test_case(18) {
+            Ok(_) => println!("测试用例18通过！"),
+            Err(e) => panic!("测试用例18失败: {}", e),
+        }
+    }
 
     #[test]
     fn test_all_public_cases() {
