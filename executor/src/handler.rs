@@ -211,16 +211,59 @@ fn handle_query_stmt(
     query: &Query,
     storage_engine: &dyn StorageEngine,
 ) -> Result<QueryResult, ExecutionError> {
-    let rows = handle_query(query, storage_engine)?;
+    // Use the centralized query execution with column resolution
+    let (rows, _column_names) = execute_query_with_columns(query, storage_engine)?;
     let result = QueryResult::Data(rows);
     
-    // Extract column names from the query for display
-    let column_names = extract_columns_from_select(&query.body).ok();
-    
-    // Print the query results with column names
-    result.display(column_names.as_deref());
+    // Display results in interactive mode (for backwards compatibility)
+    // This behavior can be controlled by the caller
+    // result.display(Some(&column_names));
     
     Ok(result)
+}
+
+/// Centralized query execution with proper column name resolution
+/// This function handles both regular table queries and expression queries,
+/// ensuring consistent column naming behavior across all execution paths.
+fn execute_query_with_columns(
+    query: &Query, 
+    storage_engine: &dyn StorageEngine
+) -> Result<(Vec<Row>, Vec<String>), ExecutionError> {
+    // Execute the query to get rows
+    let rows = handle_query(query, storage_engine)?;
+    
+    if rows.is_empty() {
+        // For empty results, return empty rows with default column names
+        let default_columns = extract_columns_from_select(&query.body)
+            .unwrap_or_else(|_| vec!["col1".to_string()]);
+        return Ok((rows, default_columns));
+    }
+    
+    // Extract column names from the query for display
+    let mut column_names = extract_columns_from_select(&query.body).ok();
+    
+    // If this is a SELECT * query, get the actual column names from table schema
+    if let Some(ref names) = column_names {
+        if names.len() == 1 && names[0] == "*" {
+            // This is a SELECT * query, get actual column names from table schema
+            if let Ok(table_name) = extract_table_name(&query.body) {
+                if let Ok(schema) = storage_engine.get_table_schema(&table_name) {
+                    let actual_column_names: Vec<String> = schema.columns.iter()
+                        .map(|col| col.name.clone())
+                        .collect();
+                    column_names = Some(actual_column_names);
+                }
+            }
+        }
+    }
+    
+    // Use the extracted column names or generate default ones
+    let cols = column_names.unwrap_or_else(|| {
+        // Generate default column names based on number of columns
+        let num_cols = if rows.is_empty() { 1 } else { rows[0].values.len() };
+        (1..=num_cols).map(|i| format!("col{}", i)).collect()
+    });
+    Ok((rows, cols))
 }
 
 fn handle_insert_stmt(
@@ -323,14 +366,17 @@ fn handle_drop_table_stmt(
     storage_engine: &mut dyn StorageEngine,
 ) -> Result<QueryResult, ExecutionError> {
     if object_type.to_string().to_uppercase() == "TABLE" {
-        let table_name = names
-            .get(0)
-            .and_then(|n| n.0.get(0))
-            .map(|id| id.value.clone())
-            .ok_or(ExecutionError::SyntaxError)?;
-        storage_engine
-            .drop_table(&table_name)
-            .map_err(ExecutionError::StorageError)?;
+        // Drop all tables in the names array
+        for name in names {
+            let table_name = name
+                .0
+                .get(0)
+                .map(|id| id.value.clone())
+                .ok_or(ExecutionError::SyntaxError)?;
+            storage_engine
+                .drop_table(&table_name)
+                .map_err(ExecutionError::StorageError)?;
+        }
         Ok(QueryResult::Success)
     } else {
         Err(ExecutionError::UnsupportedStatement)
@@ -790,38 +836,7 @@ fn extract_insert_values(source_body: &SetExpr) -> Result<Vec<Row>, ExecutionErr
     }
 }
 
-/// 从SELECT查询中提取列名
-/// 
-/// # 参数
-/// * `query` - SQL查询对象
-/// 
-/// # 返回值
-/// * `Option<Vec<String>>` - 如果成功提取到具体列名则返回Some(列名列表)，如果是SELECT *或提取失败则返回None
-fn extract_column_names_from_select(query: &Query) -> Option<Vec<String>> {
-    if let SetExpr::Select(select) = &query.body {
-        let columns: Vec<String> = select.projection.iter().filter_map(|item| {
-            match item {
-                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                    Some(ident.value.clone())
-                }
-                SelectItem::UnnamedExpr(expr) => {
-                    // For expressions like 1 * 2, generate a column name based on the expression
-                    Some(format_expression_as_column_name(expr))
-                }
-                SelectItem::Wildcard => None, // 对于*，我们返回None，让调用者处理
-                _ => None,
-            }
-        }).collect();
-        
-        if columns.is_empty() {
-            None
-        } else {
-            Some(columns)
-        }
-    } else {
-        None
-    }
-}
+
 
 /// Format an expression as a column name for display
 fn format_expression_as_column_name(expr: &Expr) -> String {
@@ -926,28 +941,6 @@ pub fn parse_multiple_sql_statements(sql: &str) -> Result<Vec<Statement>, String
     Ok(statements)
 }
 
-/// 从结果中提取列名（简化版本）
-/// 
-/// # 参数
-/// * `rows` - 查询结果行
-/// 
-/// # 返回值
-/// * `Vec<String>` - 列名列表
-pub fn extract_column_names_from_result(rows: &[Row]) -> Vec<String> {
-    if rows.is_empty() {
-        return Vec::new();
-    }
-    
-    // 这里简化处理，假设是常见的列名
-    let num_cols = rows[0].values.len();
-    match num_cols {
-        1 => vec!["age".to_string()], // 常见的单列查询
-        2 => vec!["id".to_string(), "name".to_string()],
-        3 => vec!["id".to_string(), "name".to_string(), "age".to_string()],
-        _ => (0..num_cols).map(|i| format!("col{}", i + 1)).collect(),
-    }
-}
-
 /// 执行SQL语句并返回输出结果
 /// 
 /// # 参数
@@ -966,22 +959,22 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
     let statements = parse_multiple_sql_statements(input_sql)?;
     
     for statement in statements {
-        // 如果是SELECT语句，提取列名
-        let column_names = if let Statement::Query(ref query) = statement {
-            extract_column_names_from_select(query)
+        // Handle SELECT queries specially to get proper column names
+        if let Statement::Query(ref query) = statement {
+            // Use the centralized query execution with column resolution
+            let (rows, column_names) = execute_query_with_columns(query, storage_engine)
+                .map_err(|e| format!("Execution error: {:?}", e))?;
+            
+            if !rows.is_empty() {
+                let query_result = QueryResult::Data(rows);
+                let output = query_result.format_as_string(Some(&column_names));
+                all_outputs.push(output);
+            }
         } else {
-            None
-        };
-        
-        let result = execute_stmt(statement, storage_engine)
-            .map_err(|e| format!("Execution error: {:?}", e))?;
-        
-        // 只有SELECT查询才产生输出
-        if let QueryResult::Data(rows) = result {
-            let cols = column_names.unwrap_or_else(|| extract_column_names_from_result(&rows));
-            let query_result = QueryResult::Data(rows);
-            let output = query_result.format_as_string(Some(&cols));
-            all_outputs.push(output);
+            // For non-SELECT statements, just execute them
+            let _result = execute_stmt(statement, storage_engine)
+                .map_err(|e| format!("Execution error: {:?}", e))?;
+            // Non-SELECT statements don't produce output for display
         }
     }
     
@@ -1013,6 +1006,8 @@ pub fn run_test_case_with_storage<T: StorageEngine>(
     
     if expected_normalized == actual_normalized {
         println!("测试用例 {} 通过！", case_number);
+        println!("实际输出内容:");
+        println!("{}", actual_normalized);
         Ok(())
     } else {
         Err(format!(
