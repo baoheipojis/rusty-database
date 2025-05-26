@@ -605,9 +605,14 @@ fn handle_query(
 
     // Now handle compound conditions and expression evaluation
     if let SetExpr::Select(select_expr) = query_body_ref {
-        // Apply compound condition filtering if needed
+        // Apply compound condition filtering only if we have compound conditions (AND/OR)
         let filtered_rows = if let Some(selection_expr) = &select_expr.selection {
-            filter_rows_with_compound_conditions(&initial_rows, selection_expr, &table_name, storage_engine)?
+            if has_compound_conditions(selection_expr) {
+                filter_rows_with_compound_conditions(&initial_rows, selection_expr, &table_name, storage_engine)?
+            } else {
+                // Simple condition already handled by storage engine
+                initial_rows
+            }
         } else {
             initial_rows
         };
@@ -1117,6 +1122,19 @@ fn extract_simple_condition_from_expr(expr: &Expr) -> Result<Option<Condition>, 
     }
 }
 
+/// Check if an expression contains compound conditions (AND/OR)
+fn has_compound_conditions(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { op, left, right, .. } => {
+            match op {
+                BinaryOperator::And | BinaryOperator::Or => true,
+                _ => has_compound_conditions(left) || has_compound_conditions(right),
+            }
+        }
+        _ => false,
+    }
+}
+
 /// 从 INSERT 语句的 VALUES 部分提取行数据
 /// 
 /// # 参数
@@ -1196,7 +1214,17 @@ fn format_expression_as_column_name(expr: &Expr) -> String {
                 BinaryOperator::Divide => "/",
                 _ => "?",
             };
-            format!("{}{}{}", left_str, op_str, right_str)
+            
+            // Smart formatting: Add spaces around operators when both operands are literals
+            // This helps distinguish between patterns like "1 * 2" vs "price*2"
+            let needs_spaces = matches!(left.as_ref(), Expr::Value(_)) && 
+                              matches!(right.as_ref(), Expr::Value(_));
+            
+            if needs_spaces {
+                format!("{} {} {}", left_str, op_str, right_str)
+            } else {
+                format!("{}{}{}", left_str, op_str, right_str)
+            }
         }
         Expr::Identifier(ident) => ident.value.clone(),
         _ => "expr".to_string(),
