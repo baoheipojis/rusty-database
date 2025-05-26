@@ -438,6 +438,16 @@ fn handle_query(
 ) -> Result<Vec<Row>, ExecutionError> {
     // Dereference Box<SetExpr> to get &SetExpr for helper functions
     let query_body_ref: &SetExpr = &query.body;
+    
+    // Check if this is a SELECT without FROM clause (expression evaluation)
+    if let SetExpr::Select(select_expr) = query_body_ref {
+        if select_expr.from.is_empty() {
+            // This is a SELECT expression without FROM clause, e.g., SELECT 1 * 2
+            return handle_expression_query(select_expr);
+        }
+    }
+    
+    // Regular table query
     let table_name = extract_table_name(query_body_ref)?;
     let columns = extract_columns_from_select(query_body_ref)?;
     let condition = extract_condition_from_select(query_body_ref)?;
@@ -445,6 +455,65 @@ fn handle_query(
     storage_engine
         .select_rows(&table_name, columns, condition)
         .map_err(ExecutionError::StorageError)
+}
+
+/// Handle SELECT queries without FROM clause (expression evaluation)
+fn handle_expression_query(select_expr: &Box<sqlparser::ast::Select>) -> Result<Vec<Row>, ExecutionError> {
+    let mut row_values = Vec::new();
+    
+    for item in &select_expr.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                let value = evaluate_expression(expr)?;
+                row_values.push(value);
+            }
+            _ => return Err(ExecutionError::UnsupportedStatement),
+        }
+    }
+    
+    // Return a single row with the calculated values
+    Ok(vec![Row { values: row_values }])
+}
+
+/// Evaluate an expression to get its value
+fn evaluate_expression(expr: &Expr) -> Result<Value, ExecutionError> {
+    match expr {
+        Expr::Value(sqlparser::ast::Value::Number(s, _)) => {
+            s.parse::<i32>()
+                .map(Value::Int)
+                .map_err(|_| ExecutionError::SyntaxError)
+        }
+        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+            Ok(Value::Varchar(s.clone()))
+        }
+        Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => {
+            Ok(Value::Varchar(s.clone()))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = evaluate_expression(left)?;
+            let right_val = evaluate_expression(right)?;
+            
+            match (left_val, right_val) {
+                (Value::Int(a), Value::Int(b)) => {
+                    match op {
+                        BinaryOperator::Plus => Ok(Value::Int(a + b)),
+                        BinaryOperator::Minus => Ok(Value::Int(a - b)),
+                        BinaryOperator::Multiply => Ok(Value::Int(a * b)),
+                        BinaryOperator::Divide => {
+                            if b == 0 {
+                                Err(ExecutionError::SyntaxError) // Division by zero
+                            } else {
+                                Ok(Value::Int(a / b))
+                            }
+                        }
+                        _ => Err(ExecutionError::UnsupportedStatement),
+                    }
+                }
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        _ => Err(ExecutionError::UnsupportedStatement),
+    }
 }
 
 // Removed unused columns_idents parameter
@@ -588,6 +657,10 @@ fn extract_columns_from_select(query_body: &SetExpr) -> Result<Vec<String>, Exec
                 .map(|item| {
                     match item {
                         SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident.value.clone(),
+                        SelectItem::UnnamedExpr(expr) => {
+                            // For expressions like 1 * 2, generate a column name based on the expression
+                            format_expression_as_column_name(expr)
+                        },
                         SelectItem::Wildcard => "*".to_string(),
                         // TODO: Handle AliasedExpr, QualifiedWildcard, etc.
                         _ => unimplemented!("Unsupported select item for column extraction"),
@@ -731,6 +804,10 @@ fn extract_column_names_from_select(query: &Query) -> Option<Vec<String>> {
                 SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
                     Some(ident.value.clone())
                 }
+                SelectItem::UnnamedExpr(expr) => {
+                    // For expressions like 1 * 2, generate a column name based on the expression
+                    Some(format_expression_as_column_name(expr))
+                }
                 SelectItem::Wildcard => None, // 对于*，我们返回None，让调用者处理
                 _ => None,
             }
@@ -743,6 +820,29 @@ fn extract_column_names_from_select(query: &Query) -> Option<Vec<String>> {
         }
     } else {
         None
+    }
+}
+
+/// Format an expression as a column name for display
+fn format_expression_as_column_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Value(sqlparser::ast::Value::Number(s, _)) => s.clone(),
+        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => s.clone(),
+        Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => s.clone(),
+        Expr::BinaryOp { left, op, right } => {
+            let left_str = format_expression_as_column_name(left);
+            let right_str = format_expression_as_column_name(right);
+            let op_str = match op {
+                BinaryOperator::Plus => "+",
+                BinaryOperator::Minus => "-",
+                BinaryOperator::Multiply => "*",
+                BinaryOperator::Divide => "/",
+                _ => "?",
+            };
+            format!("{} {} {}", left_str, op_str, right_str)
+        }
+        Expr::Identifier(ident) => ident.value.clone(),
+        _ => "expr".to_string(),
     }
 }
 
