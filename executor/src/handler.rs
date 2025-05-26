@@ -291,9 +291,20 @@ fn handle_create_table_stmt(
     let schema = Schema {
         columns: schema_columns,
     };
+    // storage_engine.create_table() 返回 Result<(), String>
+    // 但是这个函数需要返回 Result<QueryResult, ExecutionError>
+    // 所以需要把 String 错误转换成 ExecutionError
+    // 注意由于后面有个?，所以如果出错了，就会直接返回错误，不会走到后面的Ok了。
     storage_engine
         .create_table(&table_name_str, schema)
-        .map_err(ExecutionError::StorageError)?;
+        .map_err(ExecutionError::StorageError)?; // 把 String 转换成 ExecutionError::StorageError
+    
+    // 等价于以下写法：
+    // match storage_engine.create_table(&table_name_str, schema) {
+    //     Ok(()) => Ok(QueryResult::Success),
+    //     Err(storage_error) => Err(ExecutionError::StorageError(storage_error)),
+    // }
+    
     Ok(QueryResult::Success)
 }
 
@@ -336,10 +347,22 @@ fn handle_query(
 // Removed unused columns_idents parameter
 fn handle_insert(
     table_name_obj: &ObjectName,
-    _columns_idents: &[Ident],
+    columns_idents: &[Ident], // 详细解释这个类型
     source_query: &Query,
     storage_engine: &mut dyn StorageEngine,
 ) -> Result<(), ExecutionError> {
+    // 类型解释：
+    // &[Ident] 是什么？
+    // - & 表示借用（引用）
+    // - [] 表示切片（slice）
+    // - Ident 是 sqlparser 库中的标识符类型
+    // 
+    // 完整含义：一个指向 Ident 元素切片的不可变引用
+    // 
+    // 具体来说：
+    // - 当SQL是 INSERT INTO table (col1, col2, col3) VALUES (...)
+    // - columns_idents 就包含 [col1, col2, col3] 这些列名的标识符
+    
     let table_name_str = table_name_obj
         .0
         .get(0)
@@ -347,13 +370,71 @@ fn handle_insert(
         .value
         .clone();
 
-    // Dereference Box<SetExpr> to get &SetExpr for helper functions
-    let source_body_ref: &SetExpr = &source_query.body;
-    let rows_to_insert = extract_insert_values(source_body_ref)?; // Pass &SetExpr
+    // 获取表的schema来了解所有列
+    let table_schema = storage_engine
+        .get_table_schema(&table_name_str)
+        .map_err(ExecutionError::StorageError)?;
 
-    for row in rows_to_insert {
+    // 提取指定的列名 - 演示如何使用 &[Ident]
+    let specified_columns: Vec<String> = columns_idents
+        .iter()              // 迭代切片中的每个 &Ident
+        .map(|ident| ident.value.clone())  // 提取每个标识符的字符串值
+        .collect();          // 收集成 Vec<String>
+
+    // source_query.body 包含了 INSERT 语句中的 VALUES 部分
+    let source_body_ref: &SetExpr = &source_query.body;
+    
+    // extract_insert_values 会解析 VALUES 部分，提取出实际的行数据
+    let partial_rows = extract_insert_values(source_body_ref)?;
+
+    for partial_row in partial_rows {
+        // 验证部分行的值数量是否与指定列数量匹配
+        if partial_row.values.len() != specified_columns.len() {
+            return Err(ExecutionError::StorageError(format!(
+                "Error: Number of values ({}) doesn't match number of specified columns ({})",
+                partial_row.values.len(),
+                specified_columns.len()
+            )));
+        }
+
+        // 创建完整的行，为所有列分配值
+        let mut complete_values = vec![Value::Null; table_schema.columns.len()];
+        
+        // 将指定列的值填入对应位置
+        for (i, column_name) in specified_columns.iter().enumerate() {
+            // 找到这个列在表schema中的位置
+            let schema_column_index = table_schema
+                .columns
+                .iter()
+                .position(|col| &col.name == column_name)
+                .ok_or_else(|| ExecutionError::StorageError(format!(
+                    "Error: Column '{}' does not exist in table '{}'",
+                    column_name, table_name_str
+                )))?;
+            
+            // 将值放到正确的位置
+            complete_values[schema_column_index] = partial_row.values[i].clone();
+        }
+
+        // 检查约束（在存储之前）
+        for (col_idx, column) in table_schema.columns.iter().enumerate() {
+            let value = &complete_values[col_idx];
+            
+            // 检查 NOT NULL 约束
+            if column.constraints.contains(&Constraint::NotNull) {
+                if matches!(value, Value::Null) {
+                    return Err(ExecutionError::StorageError(format!(
+                        "NOT NULL constraint violation: column '{}' cannot be NULL. You must provide a value for this column.",
+                        column.name
+                    )));
+                }
+            }
+        }
+
+        // 创建完整的行并插入
+        let complete_row = Row { values: complete_values };
         storage_engine
-            .insert_row(&table_name_str, row)
+            .insert_row(&table_name_str, complete_row)
             .map_err(ExecutionError::StorageError)?;
     }
     Ok(())
@@ -1334,4 +1415,111 @@ pub mod tests {
         println!("Output with minimum width:");
         println!("{}", output);
     }
+
+    #[test]
+    fn test_map_err_explanation() {
+        // 演示 map_err 的用法
+        
+        // 假设我们有一个返回 Result<i32, String> 的函数
+        fn divide(a: i32, b: i32) -> Result<i32, String> {
+            if b == 0 {
+                Err("Division by zero".to_string())
+            } else {
+                Ok(a / b)
+            }
+        }
+        
+        // 定义我们自己的错误类型
+        #[derive(Debug, PartialEq)]
+        enum MyError {
+            MathError(String),
+            Other,
+        }
+        
+        // 使用 map_err 转换错误类型
+        let result: Result<i32, MyError> = divide(10, 2)
+            .map_err(MyError::MathError); // 把 String 转换成 MyError::MathError
+        
+        assert_eq!(result, Ok(5));
+        
+        let error_result: Result<i32, MyError> = divide(10, 0)
+            .map_err(MyError::MathError); // 把 String 转换成 MyError::MathError
+        
+        assert_eq!(error_result, Err(MyError::MathError("Division by zero".to_string())));
+        
+        // map_err 等价于：
+        let manual_result: Result<i32, MyError> = match divide(10, 0) {
+            Ok(value) => Ok(value),
+            Err(string_error) => Err(MyError::MathError(string_error)),
+        };
+        
+        assert_eq!(manual_result, Err(MyError::MathError("Division by zero".to_string())));
+        
+        println!("map_err 测试通过！");
+    }
+
+    #[test]
+    fn test_public_case_1() {
+        let mut mock_storage = MockExecutorStorageEngine::new();
+        
+        // 执行公开测试用例1的SQL序列
+        
+        // 1. 创建表
+        let create_sql = "CREATE TABLE genres (
+            id INT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL
+        );";
+        let statement = parse_sql_to_statement(create_sql);
+        let result = execute_stmt(statement, &mut mock_storage);
+        assert!(result.is_ok(), "CREATE TABLE should succeed");
+        
+        // 2. 插入数据 - 第一条记录
+        let insert_sql1 = "INSERT INTO genres VALUES (1, \"Science Fiction\");";
+        let statement = parse_sql_to_statement(insert_sql1);
+        let result = execute_stmt(statement, &mut mock_storage);
+        assert!(result.is_ok(), "First INSERT should succeed");
+        
+        // 3. 插入数据 - 第二条记录
+        let insert_sql2 = "INSERT INTO genres VALUES (2, \"Action\");";
+        let statement = parse_sql_to_statement(insert_sql2);
+        let result = execute_stmt(statement, &mut mock_storage);
+        assert!(result.is_ok(), "Second INSERT should succeed");
+        
+        // 4. 查询所有数据
+        let select_sql = "SELECT * FROM genres;";
+        let statement = parse_sql_to_statement(select_sql);
+        let result = execute_stmt(statement, &mut mock_storage);
+        
+        // 验证查询结果
+        match result {
+            Ok(QueryResult::Data(rows)) => {
+                assert_eq!(rows.len(), 2, "Should have 2 rows");
+                
+                // 验证第一行数据
+                assert_eq!(rows[0].values[0], Value::Int(1));
+                assert_eq!(rows[0].values[1], Value::Varchar("Science Fiction".to_string()));
+                
+                // 验证第二行数据
+                assert_eq!(rows[1].values[0], Value::Int(2));
+                assert_eq!(rows[1].values[1], Value::Varchar("Action".to_string()));
+                
+                // 验证输出格式与期望的完全匹配
+                let query_result = QueryResult::Data(rows);
+                let column_names = vec!["id".to_string(), "name".to_string()];
+                let actual_output = query_result.format_as_string(Some(&column_names));
+                
+                // 期望的输出格式（来自output.txt）
+                let expected_output = "| id  | name            |\n| --- | --------------- |\n| 1   | Science Fiction |\n| 2   | Action          |\n";
+                
+                assert_eq!(actual_output, expected_output, 
+                    "Output format should match expected format exactly.\nExpected:\n{}\nActual:\n{}", 
+                    expected_output, actual_output);
+            }
+            Ok(_) => panic!("Expected Data result for SELECT query"),
+            Err(e) => panic!("SELECT query failed: {:?}", e),
+        }
+        
+        println!("公开测试用例1通过！");
+    }
+
 }
