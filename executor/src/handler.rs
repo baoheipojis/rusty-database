@@ -203,6 +203,11 @@ pub fn execute_stmt(
             selection,
             ..
         } => handle_update_stmt(&table, &assignments, selection.as_ref(), storage_engine),
+        Statement::Delete {
+            table_name,
+            selection,
+            ..
+        } => handle_delete_stmt(&table_name, selection.as_ref(), storage_engine),
         _ => Err(ExecutionError::UnsupportedStatement),
     }
 }
@@ -422,6 +427,10 @@ fn handle_update_stmt(
                 Value::Varchar(s.clone())
             }
             Expr::Value(sqlparser::ast::Value::Null) => Value::Null,
+            // Handle identifiers with quote styles (double-quoted strings parsed as identifiers)
+            Expr::Identifier(ident) if ident.quote_style.is_some() => {
+                Value::Varchar(ident.value.clone())
+            }
             _ => return Err(ExecutionError::UnsupportedStatement),
         };
         
@@ -439,6 +448,10 @@ fn handle_update_stmt(
 
                 let value_expr = match right.as_ref() {
                     Expr::Value(v) => v,
+                    Expr::Identifier(ident) if ident.quote_style.is_some() => {
+                        // Convert quoted identifier to a SingleQuotedString value for processing
+                        &sqlparser::ast::Value::SingleQuotedString(ident.value.clone())
+                    }
                     _ => return Err(ExecutionError::UnsupportedStatement),
                 };
 
@@ -473,6 +486,73 @@ fn handle_update_stmt(
     // Execute the update
     let rows_affected = storage_engine
         .update_rows(&table_name, updates, condition)
+        .map_err(ExecutionError::StorageError)?;
+    
+    Ok(QueryResult::RowsAffected(rows_affected))
+}
+
+fn handle_delete_stmt(
+    table_name: &ObjectName,
+    selection: Option<&Expr>,
+    storage_engine: &mut dyn StorageEngine,
+) -> Result<QueryResult, ExecutionError> {
+    // 提取表名
+    let table_name = table_name
+        .0
+        .get(0)
+        .ok_or(ExecutionError::SyntaxError)?
+        .value
+        .clone();
+
+    // 处理WHERE条件（如果存在）
+    let condition = if let Some(where_expr) = selection {
+        match where_expr {
+            Expr::BinaryOp { left, op, right } => {
+                let left_col = match left.as_ref() {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                };
+
+                let value_expr = match right.as_ref() {
+                    Expr::Value(v) => v,
+                    Expr::Identifier(ident) if ident.quote_style.is_some() => {
+                        // Convert quoted identifier to a SingleQuotedString value for processing
+                        &sqlparser::ast::Value::SingleQuotedString(ident.value.clone())
+                    }
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                };
+
+                let parsed_value = match value_expr {
+                    sqlparser::ast::Value::Number(s, _) => s
+                        .parse::<i32>()
+                        .map(Value::Int)
+                        .map_err(|_| ExecutionError::SyntaxError)?,
+                    sqlparser::ast::Value::SingleQuotedString(s) => {
+                        Value::Varchar(s.clone())
+                    }
+                    sqlparser::ast::Value::DoubleQuotedString(s) => {
+                        Value::Varchar(s.clone())
+                    }
+                    sqlparser::ast::Value::Boolean(b) => Value::Varchar(b.to_string()),
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                };
+
+                match op {
+                    BinaryOperator::Eq => Some(Condition::Equals(left_col, parsed_value)),
+                    BinaryOperator::Gt => Some(Condition::GreaterThan(left_col, parsed_value)),
+                    BinaryOperator::Lt => Some(Condition::LessThan(left_col, parsed_value)),
+                    _ => return Err(ExecutionError::UnsupportedStatement),
+                }
+            }
+            _ => return Err(ExecutionError::UnsupportedStatement),
+        }
+    } else {
+        None
+    };
+
+    // 执行删除操作
+    let rows_affected = storage_engine
+        .delete_rows(&table_name, condition)
         .map_err(ExecutionError::StorageError)?;
     
     Ok(QueryResult::RowsAffected(rows_affected))
@@ -959,6 +1039,9 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
     let statements = parse_multiple_sql_statements(input_sql)?;
     
     for statement in statements {
+        // Debug: print the statement being executed
+        println!("Debug: Executing statement: {:?}", statement);
+        
         // Handle SELECT queries specially to get proper column names
         if let Statement::Query(ref query) = statement {
             // Use the centralized query execution with column resolution
@@ -973,7 +1056,9 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
         } else {
             // For non-SELECT statements, just execute them
             let _result = execute_stmt(statement, storage_engine)
-                .map_err(|e| format!("Execution error: {:?}", e))?;
+                .map_err(|e| {
+                    format!("Execution error: {:?}", e)
+                })?;
             // Non-SELECT statements don't produce output for display
         }
     }
@@ -1146,10 +1231,62 @@ pub mod tests {
 
         fn delete_rows(
             &mut self,
-            _table_name: &str,
-            _condition: Option<Condition>,
+            table_name: &str,
+            condition: Option<Condition>,
         ) -> Result<u64, String> {
-            unimplemented!()
+            match self.tables.get_mut(table_name) {
+                Some((schema, rows)) => {
+                    let original_length = rows.len();
+                    
+                    rows.retain(|row| {
+                        if let Some(ref cond) = condition {
+                            match cond {
+                                Condition::Equals(col_name, expected_val) => {
+                                    if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                        if &row.values[col_idx] == expected_val {
+                                            return false; // Delete this row
+                                        }
+                                    }
+                                    true // Keep this row
+                                }
+                                Condition::GreaterThan(col_name, expected_val) => {
+                                    if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                        let should_delete = match (&row.values[col_idx], expected_val) {
+                                            (Value::Int(a), Value::Int(e)) => a > e,
+                                            (Value::Varchar(a), Value::Varchar(e)) => a > e,
+                                            _ => false,
+                                        };
+                                        if should_delete {
+                                            return false; // Delete this row
+                                        }
+                                    }
+                                    true // Keep this row
+                                }
+                                Condition::LessThan(col_name, expected_val) => {
+                                    if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
+                                        let should_delete = match (&row.values[col_idx], expected_val) {
+                                            (Value::Int(a), Value::Int(e)) => a < e,
+                                            (Value::Varchar(a), Value::Varchar(e)) => a < e,
+                                            _ => false,
+                                        };
+                                        if should_delete {
+                                            return false; // Delete this row
+                                        }
+                                    }
+                                    true // Keep this row
+                                }
+                                _ => true, // Keep row for unsupported conditions
+                            }
+                        } else {
+                            false // No condition means delete all rows
+                        }
+                    });
+                    
+                    let deleted_count = original_length - rows.len();
+                    Ok(deleted_count as u64)
+                }
+                None => Err(format!("Table {} not found", table_name)),
+            }
         }
 
         fn select_rows(
@@ -2171,7 +2308,7 @@ pub mod tests {
 
     #[test]
     fn test_run_test_case_11() {
-        // 使用通用测试函数测试用例11
+        // 使用通用测试加函数测试用例11
         match run_test_case(11) {
             Ok(_) => println!("测试用例11通过！"),
             Err(e) => panic!("测试用例11失败: {}", e),
