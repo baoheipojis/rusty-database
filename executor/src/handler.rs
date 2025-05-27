@@ -81,7 +81,7 @@ impl QueryResult {
                             let display_str = match value {
                                 Value::Int(n) => n.to_string(),
                                 Value::Varchar(s) => s.clone(),
-                                Value::Null => "NULL".to_string(),
+                                Value::Null => "".to_string(),
                             };
                             print!(" {:<width$} |", display_str, width = col_widths[i]);
                         }
@@ -126,7 +126,7 @@ impl QueryResult {
                             let display_str = match value {
                                 Value::Int(n) => n.to_string(),
                                 Value::Varchar(s) => s.clone(),
-                                Value::Null => "NULL".to_string(),
+                                Value::Null => "".to_string(),
                             };
                             col_widths[i] = col_widths[i].max(display_str.len());
                         }
@@ -159,7 +159,7 @@ impl QueryResult {
                             let display_str = match value {
                                 Value::Int(n) => n.to_string(),
                                 Value::Varchar(s) => s.clone(),
-                                Value::Null => "NULL".to_string(),
+                                Value::Null => "".to_string(),
                             };
                             result.push_str(&format!(" {:<width$} |", display_str, width = col_widths[i]));
                         }
@@ -1305,6 +1305,19 @@ pub fn parse_multiple_sql_statements(sql: &str) -> Result<Vec<Statement>, String
                 }
             }
             current_statement.clear();
+        }
+    }
+    
+    // Process any remaining statement that doesn't end with semicolon
+    let remaining_stmt = current_statement.trim();
+    if !remaining_stmt.is_empty() {
+        match Parser::parse_sql(&dialect, remaining_stmt) {
+            Ok(mut parsed) => {
+                if let Some(statement) = parsed.pop() {
+                    statements.push(statement);
+                }
+            }
+            Err(e) => return Err(format!("Parse error for '{}': {}", remaining_stmt, e)),
         }
     }
     
