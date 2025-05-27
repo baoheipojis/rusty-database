@@ -586,8 +586,15 @@ fn handle_query(
         false
     };
 
-    // If we have expressions, we need to get all columns first, then apply projection
-    let columns_to_fetch = if has_expressions {
+    // Check if we have compound conditions
+    let has_compound_conds = if let SetExpr::Select(select_expr) = query_body_ref {
+        select_expr.selection.as_ref().map_or(false, |expr| has_compound_conditions(expr))
+    } else {
+        false
+    };
+
+    // If we have expressions or compound conditions, we need to get all columns first, then apply projection
+    let columns_to_fetch = if has_expressions || has_compound_conds {
         // Get all columns from table schema
         let schema = storage_engine
             .get_table_schema(&table_name)
@@ -620,6 +627,11 @@ fn handle_query(
         // Apply expression evaluation in projection only if we have expressions
         if has_expressions {
             evaluate_projection_expressions(&filtered_rows, &select_expr.projection, &table_name, storage_engine)
+        } else if has_compound_conds {
+            // For compound conditions without expressions, we still need to project to the requested columns
+            // since we fetched all columns for filtering
+            let requested_columns = extract_columns_from_select(query_body_ref)?;
+            project_rows_to_columns(&filtered_rows, &requested_columns, &table_name, storage_engine)
         } else {
             Ok(filtered_rows)
         }
@@ -671,6 +683,42 @@ fn evaluate_condition_on_row(
                 }
                 BinaryOperator::Eq | BinaryOperator::Lt | BinaryOperator::Gt => {
                     evaluate_simple_condition_on_row(left, op, right, row, schema)
+                }
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        Expr::IsNull(inner_expr) => {
+            match inner_expr.as_ref() {
+                Expr::Identifier(ident) => {
+                    let column_name = &ident.value;
+                    let column_index = schema
+                        .columns
+                        .iter()
+                        .position(|col| &col.name == column_name)
+                        .ok_or_else(|| ExecutionError::StorageError(format!("Column {} not found", column_name)))?;
+                    
+                    let row_value = row.values.get(column_index)
+                        .ok_or_else(|| ExecutionError::StorageError("Row value index out of bounds".to_string()))?;
+                    
+                    Ok(matches!(row_value, Value::Null))
+                }
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        Expr::IsNotNull(inner_expr) => {
+            match inner_expr.as_ref() {
+                Expr::Identifier(ident) => {
+                    let column_name = &ident.value;
+                    let column_index = schema
+                        .columns
+                        .iter()
+                        .position(|col| &col.name == column_name)
+                        .ok_or_else(|| ExecutionError::StorageError(format!("Column {} not found", column_name)))?;
+                    
+                    let row_value = row.values.get(column_index)
+                        .ok_or_else(|| ExecutionError::StorageError("Row value index out of bounds".to_string()))?;
+                    
+                    Ok(!matches!(row_value, Value::Null))
                 }
                 _ => Err(ExecutionError::UnsupportedStatement),
             }
@@ -734,6 +782,48 @@ fn evaluate_simple_condition_on_row(
         }
         _ => Err(ExecutionError::UnsupportedStatement),
     }
+}
+
+/// Project rows to specific columns (used for compound conditions)
+fn project_rows_to_columns(
+    rows: &[Row],
+    requested_columns: &[String],
+    table_name: &str,
+    storage_engine: &dyn StorageEngine,
+) -> Result<Vec<Row>, ExecutionError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let table_schema = storage_engine
+        .get_table_schema(table_name)
+        .map_err(ExecutionError::StorageError)?;
+
+    // Find the indices of the requested columns in the full schema
+    let mut column_indices = Vec::new();
+    for col_name in requested_columns {
+        let index = table_schema
+            .columns
+            .iter()
+            .position(|col| &col.name == col_name)
+            .ok_or_else(|| ExecutionError::StorageError(format!("Column {} not found", col_name)))?;
+        column_indices.push(index);
+    }
+
+    // Project each row to only the requested columns
+    let mut result_rows = Vec::new();
+    for row in rows {
+        let mut projected_values = Vec::new();
+        for &col_index in &column_indices {
+            let value = row.values.get(col_index)
+                .cloned()
+                .ok_or_else(|| ExecutionError::StorageError("Column index out of bounds".to_string()))?;
+            projected_values.push(value);
+        }
+        result_rows.push(Row { values: projected_values });
+    }
+
+    Ok(result_rows)
 }
 
 /// Evaluate expressions in the SELECT projection
@@ -1117,6 +1207,23 @@ fn extract_simple_condition_from_expr(expr: &Expr) -> Result<Option<Condition>, 
                 }
             }
         }
+        // Handle IS NULL and IS NOT NULL expressions
+        Expr::IsNull(expr) => {
+            match expr.as_ref() {
+                Expr::Identifier(ident) => {
+                    Ok(Some(Condition::IsNull(ident.value.clone())))
+                }
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
+        Expr::IsNotNull(expr) => {
+            match expr.as_ref() {
+                Expr::Identifier(ident) => {
+                    Ok(Some(Condition::IsNotNull(ident.value.clone())))
+                }
+                _ => Err(ExecutionError::UnsupportedStatement),
+            }
+        }
         // TODO: Handle other condition expressions
         _ => Ok(None), // No condition or unsupported condition type
     }
@@ -1490,8 +1597,8 @@ pub mod tests {
                                 Condition::GreaterThan(col_name, expected_val) => {
                                     if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
                                         match (&row.values[col_idx], expected_val) {
-                                            (Value::Int(a), Value::Int(e)) => a > e,
-                                            (Value::Varchar(a), Value::Varchar(e)) => a > e,
+                                            (Value::Int(a), Value::Int(b)) => a > b,
+                                            (Value::Varchar(a), Value::Varchar(b)) => a > b,
                                             _ => false,
                                         }
                                     } else {
@@ -1501,8 +1608,8 @@ pub mod tests {
                                 Condition::LessThan(col_name, expected_val) => {
                                     if let Some(col_idx) = schema.columns.iter().position(|c| &c.name == col_name) {
                                         match (&row.values[col_idx], expected_val) {
-                                            (Value::Int(a), Value::Int(e)) => a < e,
-                                            (Value::Varchar(a), Value::Varchar(e)) => a < e,
+                                            (Value::Int(a), Value::Int(b)) => a < b,
+                                            (Value::Varchar(a), Value::Varchar(b)) => a < b,
                                             _ => false,
                                         }
                                     } else {
@@ -1629,12 +1736,12 @@ pub mod tests {
                                     "eq" => expected_val_opt.map_or(false, |ev| actual_value == ev),
                                     "gt" => match (actual_value, expected_val_opt) {
                                         (Value::Int(a), Some(Value::Int(e))) => a > e,
-                                        (Value::Varchar(a), Some(Value::Varchar(e))) => a > e,
+                                        (Value::Varchar(a), Some(Value::Varchar(b))) => a > b,
                                         _ => false, // Type mismatch or not comparable for GT
                                     },
                                     "lt" => match (actual_value, expected_val_opt) {
                                         (Value::Int(a), Some(Value::Int(e))) => a < e,
-                                        (Value::Varchar(a), Some(Value::Varchar(e))) => a < e,
+                                        (Value::Varchar(a), Some(Value::Varchar(b))) => a < b,
                                         _ => false, // Type mismatch or not comparable for LT
                                     },
                                     "isnull" => matches!(actual_value, Value::Null),
