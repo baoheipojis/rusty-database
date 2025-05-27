@@ -1073,6 +1073,16 @@ fn handle_insert(
         for (col_idx, column) in table_schema.columns.iter().enumerate() {
             let value = &complete_values[col_idx];
             
+            // 检查 PRIMARY KEY 约束 - PRIMARY KEY 列不能为 NULL 且没有默认值
+            if column.constraints.contains(&Constraint::PrimaryKey) {
+                if matches!(value, Value::Null) {
+                    return Err(ExecutionError::StorageError(format!(
+                        "Error: Field '{}' doesn't have a default value",
+                        column.name
+                    )));
+                }
+            }
+            
             // 检查 NOT NULL 约束
             if column.constraints.contains(&Constraint::NotNull) {
                 if matches!(value, Value::Null) {
@@ -1446,7 +1456,13 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
     let mut all_outputs = Vec::new();
     
     // 分割SQL语句并执行
-    let statements = parse_multiple_sql_statements(input_sql)?;
+    let statements = match parse_multiple_sql_statements(input_sql) {
+        Ok(stmts) => stmts,
+        Err(e) => {
+            // Return parse errors as output for test comparison
+            return Ok(format!("Error: {}", e));
+        }
+    };
     
     for statement in statements {
         // Debug: print the statement being executed
@@ -1455,21 +1471,46 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
         // Handle SELECT queries specially to get proper column names
         if let Statement::Query(ref query) = statement {
             // Use the centralized query execution with column resolution
-            let (rows, column_names) = execute_query_with_columns(query, storage_engine)
-                .map_err(|e| format!("Execution error: {:?}", e))?;
-            
-            if !rows.is_empty() {
-                let query_result = QueryResult::Data(rows);
-                let output = query_result.format_as_string(Some(&column_names));
-                all_outputs.push(output);
+            match execute_query_with_columns(query, storage_engine) {
+                Ok((rows, column_names)) => {
+                    if !rows.is_empty() {
+                        let query_result = QueryResult::Data(rows);
+                        let output = query_result.format_as_string(Some(&column_names));
+                        all_outputs.push(output);
+                    }
+                },
+                Err(e) => {
+                    // Clean up error message formatting - remove redundant prefixes
+                    let error_msg = format!("{}", e);
+                    let cleaned_error = if error_msg.starts_with("Storage error: Error: ") {
+                        error_msg.replace("Storage error: ", "")
+                    } else if error_msg.starts_with("Storage error: ") {
+                        error_msg.replace("Storage error: ", "Error: ")
+                    } else {
+                        format!("Error: {}", error_msg)
+                    };
+                    return Ok(cleaned_error);
+                }
             }
         } else {
             // For non-SELECT statements, just execute them
-            let _result = execute_stmt(statement, storage_engine)
-                .map_err(|e| {
-                    format!("Execution error: {:?}", e)
-                })?;
-            // Non-SELECT statements don't produce output for display
+            match execute_stmt(statement, storage_engine) {
+                Ok(_result) => {
+                    // Non-SELECT statements don't produce output for display
+                },
+                Err(e) => {
+                    // Clean up error message formatting - remove redundant prefixes
+                    let error_msg = format!("{}", e);
+                    let cleaned_error = if error_msg.starts_with("Storage error: Error: ") {
+                        error_msg.replace("Storage error: ", "")
+                    } else if error_msg.starts_with("Storage error: ") {
+                        error_msg.replace("Storage error: ", "Error: ")
+                    } else {
+                        format!("Error: {}", error_msg)
+                    };
+                    return Ok(cleaned_error);
+                }
+            }
         }
     }
     
