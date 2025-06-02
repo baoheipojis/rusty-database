@@ -1262,15 +1262,10 @@ fn has_compound_conditions(expr: &Expr) -> bool {
 /// - `Err(ExecutionError)`: 解析失败或不支持的语法
 /// 
 /// # 示例
-/// ```rust
-/// use sqlparser::ast::SetExpr;
-/// 
-/// // 解析 INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')
-/// let rows = extract_insert_values(&values_expr)?;
-/// // 返回: Vec<Row> 包含两行数据
-/// // Row 1: [Value::Int(1), Value::Varchar("Alice".to_string())]
-/// // Row 2: [Value::Int(2), Value::Varchar("Bob".to_string())]
-/// ```
+/// 解析 INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob') 
+/// 返回: Vec<Row> 包含两行数据
+/// - Row 1: [Value::Int(1), Value::Varchar("Alice".to_string())]
+/// - Row 2: [Value::Int(2), Value::Varchar("Bob".to_string())]
 fn extract_insert_values(source_body: &SetExpr) -> Result<Vec<Row>, ExecutionError> {
     match source_body {
         // No need for as_ref() if already &SetExpr
@@ -1453,6 +1448,7 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
     input_sql: &str,
     storage_engine: &mut T
 ) -> Result<String, String> {
+    // Rust的意思是，要么返回Ok(String)，要么返回Err(String)
     let mut all_outputs = Vec::new();
     
     // 分割SQL语句并执行
@@ -1465,7 +1461,8 @@ pub fn execute_sql_and_get_output<T: StorageEngine>(
     };
     
     for statement in statements {
-        // Debug: print the statement being executed
+        // Debug: print the statement being executed (only in debug builds)
+        #[cfg(debug_assertions)]
         println!("Debug: Executing statement: {:?}", statement);
         
         // Handle SELECT queries specially to get proper column names
