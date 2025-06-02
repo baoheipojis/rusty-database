@@ -193,10 +193,9 @@ pub fn execute_stmt(
         } => handle_create_table_stmt(&name, &ast_columns, storage_engine),
         Statement::Drop {
             object_type,
-            if_exists,
             names,
             ..
-        } => handle_drop_table_stmt(&object_type, if_exists, &names, storage_engine),
+        } => handle_drop_table_stmt(&object_type, &names, storage_engine),
         Statement::Update {
             table,
             assignments,
@@ -355,18 +354,13 @@ fn handle_create_table_stmt(
         .create_table(&table_name_str, schema)
         .map_err(ExecutionError::StorageError)?; // 把 String 转换成 ExecutionError::StorageError
     
-    // 等价于以下写法：
-    // match storage_engine.create_table(&table_name_str, schema) {
-    //     Ok(()) => Ok(QueryResult::Success),
-    //     Err(storage_error) => Err(ExecutionError::StorageError(storage_error)),
-    // }
+    
     
     Ok(QueryResult::Success)
 }
 
 fn handle_drop_table_stmt(
     object_type: &sqlparser::ast::ObjectType,
-    _if_exists: bool,
     names: &[ObjectName],
     storage_engine: &mut dyn StorageEngine,
 ) -> Result<QueryResult, ExecutionError> {
@@ -1139,8 +1133,18 @@ fn extract_columns_from_select(query_body: &SetExpr) -> Result<Vec<String>, Exec
                             format_expression_as_column_name(expr)
                         },
                         SelectItem::Wildcard => "*".to_string(),
-                        // TODO: Handle AliasedExpr, QualifiedWildcard, etc.
-                        _ => unimplemented!("Unsupported select item for column extraction"),
+                        SelectItem::QualifiedWildcard(object_name) => {
+                            // Handle table.* syntax
+                            if let Some(ident) = object_name.0.get(0) {
+                                format!("{}.*", ident.value)
+                            } else {
+                                "*".to_string()
+                            }
+                        },
+                        SelectItem::ExprWithAlias { expr: _, alias } => {
+                            // For aliased expressions like "column AS alias", use the alias name
+                            alias.value.clone()
+                        },
                     }
                 })
                 .collect())
@@ -2529,7 +2533,6 @@ pub mod tests {
         #[derive(Debug, PartialEq)]
         enum MyError {
             MathError(String),
-            Other,
         }
         
         // 使用 map_err 转换错误类型
