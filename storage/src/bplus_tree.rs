@@ -1,10 +1,8 @@
-// bplus_tree.rs
-
 #[derive(Debug, Clone)]
 struct BPlusTreeNode {
-    is_leaf: bool,                     // 节点是否为叶子节点
-    keys: Vec<i32>,                   // 节点中的关键字
-    children: Vec<Box<BPlusTreeNode>>, // 孩子节点的引用
+    is_leaf: bool,                          // 节点是否为叶子节点
+    keys: Vec<i32>,                        // 节点中的关键字，使用 i32 类型
+    children: Vec<Box<BPlusTreeNode>>,      // 子节点的引用
 }
 
 impl BPlusTreeNode {
@@ -35,63 +33,60 @@ impl BPlusTree {
     /// 参数: degree - 树的阶（最小度数）
     pub fn new(degree: usize) -> Self {
         Self {
-            root: Box::new(BPlusTreeNode::new_leaf()), // Root starts as a leaf
+            root: Box::new(BPlusTreeNode::new_leaf()), // 根节点初始化为叶子节点
             degree,
         }
     }
 
     /// 插入关键字
     /// 参数: key - 要插入的关键字
-    pub fn insert(&mut self, key: i32) {
-        let degree = self.degree;
-        
-        if self.root.keys.len() == (2 * degree) - 1 { // Root is full
-            // old_root_box now owns the previous root tree.
-            let old_root_box = std::mem::replace(&mut self.root, Box::new(BPlusTreeNode::new_internal())); 
-            
-            // self.root is now a new, empty internal node.
-            // Make old_root_box its first child.
-            self.root.children.push(old_root_box);
-            
-            // Now, self.root is the parent, and its child at index 0 is the (full) old root.
-            // Split this child.
-            Self::split_child_node(degree, &mut *self.root, 0);
-            
-            // After split, self.root has one key and two children.
-            // Insert the key into this (no longer empty, not full) new root structure.
-            Self::insert_non_full_node(degree, &mut *self.root, key);
-        } else { // Root is not full
-            Self::insert_non_full_node(degree, &mut *self.root, key);
+    pub fn insert(&mut self, key: i32) -> Result<(), String> {
+        if key < 0 {
+            return Err("插入的关键字不能为负数".to_string()); // 非空约束
         }
+
+        // 根节点已满时，进行分裂
+        if self.root.keys.len() == (2 * self.degree) - 1 {
+            let old_root_box = std::mem::replace(&mut self.root, Box::new(BPlusTreeNode::new_internal()));
+            self.root.children.push(old_root_box);
+            Self::split_child_node(self.degree, &mut *self.root, 0)?;
+        }
+
+        // 在非满节点中插入关键字
+        Self::insert_non_full_node(self.degree, &mut *self.root, key)
     }
 
     /// 在非满节点中插入关键字 (static helper)
     /// 参数: degree - 树的阶, node - 当前节点, key - 要插入的关键字
-    fn insert_non_full_node(degree: usize, node: &mut BPlusTreeNode, key: i32) {
+    fn insert_non_full_node(degree: usize, node: &mut BPlusTreeNode, key: i32) -> Result<(), String> {
         if node.is_leaf {
+            // 检查主键唯一性
+            if node.keys.contains(&key) {
+                return Err(format!("主键 '{}' 已存在", key)); // 唯一性约束
+            }
             let pos = node.keys.iter().position(|&k| k > key).unwrap_or(node.keys.len());
-            node.keys.insert(pos, key);
-        } else { // node is internal
+            node.keys.insert(pos, key); // 在节点中找到合适位置插入
+            Ok(())
+        } else { // 节点为内部节点
             let mut insertion_point_idx = node.keys.iter().position(|&k| k > key).unwrap_or(node.keys.len());
-            
-            // Check if the child we are about to descend into is full
+
+            // 检查待插入子节点是否已满
             if node.children[insertion_point_idx].keys.len() == (2 * degree) - 1 {
-                Self::split_child_node(degree, node, insertion_point_idx);
-                
-                // After split, the key `key` might go to the child at `insertion_point_idx` or `insertion_point_idx + 1`.
-                // `node.keys[insertion_point_idx]` is the key that was promoted from the split child.
+                Self::split_child_node(degree, node, insertion_point_idx)?;
+
+                // 若关键字大于当前节点的中间值，则选择下一个子节点
                 if key > node.keys[insertion_point_idx] {
-                    insertion_point_idx += 1; 
+                    insertion_point_idx += 1;
                 }
             }
-            // Now, child at node.children[insertion_point_idx] is guaranteed not full.
-            Self::insert_non_full_node(degree, &mut node.children[insertion_point_idx], key);
+            // 在保证子节点不满的前提下，继续插入
+            Self::insert_non_full_node(degree, &mut node.children[insertion_point_idx], key)
         }
     }
 
     /// 分裂子节点 (static helper)
     /// 参数: degree - 树的阶, parent_node - 父节点, child_index - 子节点的索引
-    fn split_child_node(degree: usize, parent_node: &mut BPlusTreeNode, child_index: usize) {
+    fn split_child_node(degree: usize, parent_node: &mut BPlusTreeNode, child_index: usize) -> Result<(), String> {
         let mut new_sibling_node_content = BPlusTreeNode {
             is_leaf: parent_node.children[child_index].is_leaf,
             keys: Vec::new(),
@@ -100,30 +95,27 @@ impl BPlusTree {
 
         let median_key;
 
-        // Scoped borrow for child_to_split_node
         {
-            let child_to_split_node = &mut parent_node.children[child_index]; // &mut Box<BPlusTreeNode>
+            let child_to_split_node = &mut parent_node.children[child_index]; // 获取需要分裂的节点
             
-            // Median key is at index `degree - 1`
-            median_key = child_to_split_node.keys[degree - 1];
-
-            // Move keys from `degree` onwards to new_sibling_node_content
-            new_sibling_node_content.keys = child_to_split_node.keys.drain(degree..).collect();
+            median_key = child_to_split_node.keys[degree - 1]; // 中间键
             
-            // Remove the median key from child_to_split_node's keys (it's already copied)
-            // and keep keys 0 to degree-2
+            // 移动关键字
+            new_sibling_node_content.keys = child_to_split_node.keys.split_off(degree);
+            // 截断原节点的关键字
             child_to_split_node.keys.truncate(degree - 1);
 
             if !child_to_split_node.is_leaf {
-                // Move children from `degree` onwards to new_sibling_node_content
-                new_sibling_node_content.children = child_to_split_node.children.drain(degree..).collect();
-                // Keep children 0 to degree-1
+                // 移动子节点
+                new_sibling_node_content.children = child_to_split_node.children.split_off(degree);
                 child_to_split_node.children.truncate(degree);
             }
-        } // child_to_split_node borrow ends
+        }
 
+        // 将中间键插入到父节点中
         parent_node.keys.insert(child_index, median_key);
         parent_node.children.insert(child_index + 1, Box::new(new_sibling_node_content));
+        Ok(())
     }
 
     /// 在树中查找关键字
@@ -144,8 +136,28 @@ impl BPlusTree {
         if node.is_leaf {
             return false; // 到达叶子节点，仍未找到
         }
-        // 递归查找子节点
-        self._search(&node.children[pos], key)
+        self._search(&node.children[pos], key) // 递归查找子节点
+    }
+
+    /// 按顺序查找并返回关键字集合
+    pub fn search_sorted(&self) -> Vec<i32> {
+        let mut result = Vec::new();
+        self.collect_keys(&self.root, &mut result);
+        result.sort_unstable(); // 无需稳定排序
+        result
+    }
+
+    fn collect_keys(&self, node: &BPlusTreeNode, result: &mut Vec<i32>) {
+        if node.is_leaf {
+            result.extend_from_slice(&node.keys); // 收集叶子节点的所有关键字
+        } else {
+            for (i, key) in node.keys.iter().enumerate() {
+                self.collect_keys(&node.children[i], result); // 递归收集子节点
+                result.push(*key); // 插入当前节点的关键字
+            }
+            // 访问最后一个子节点
+            self.collect_keys(&node.children[node.children.len() - 1], result);
+        }
     }
 
     /// 打印 B+树结构
@@ -161,5 +173,50 @@ impl BPlusTree {
         for child in &node.children {
             self._print_tree(child, level + 1); // 递归打印子节点
         }
+    }
+}
+
+// 单元测试模块
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_insert_and_search() {
+        let mut tree = BPlusTree::new(3); // 创建一个最小度数为 3 的 B+ 树
+
+        // 测试插入
+        assert!(tree.insert(10).is_ok());
+        assert!(tree.insert(20).is_ok());
+        assert!(tree.insert(5).is_ok());
+        assert!(tree.insert(15).is_ok());
+        
+        // 测试搜索
+        assert!(tree.search(10));
+        assert!(tree.search(20));
+        assert!(!tree.search(100)); // 100 应该不存在
+
+        // 测试插入重复主键
+        assert!(tree.insert(10).is_err()); // 10 已存在
+    }
+
+    #[test]
+    fn test_search_sorted() {
+        let mut tree = BPlusTree::new(3);
+        
+        // 插入一些数据
+        tree.insert(10).unwrap();
+        tree.insert(30).unwrap();
+        tree.insert(20).unwrap();
+        
+        // 检查排序结果
+        let sorted_keys = tree.search_sorted();
+        assert_eq!(sorted_keys, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_insert_negative_key() {
+        let mut tree = BPlusTree::new(3);
+        assert!(tree.insert(-1).is_err()); // 负数插入应该失败
     }
 }
