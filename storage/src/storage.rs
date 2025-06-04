@@ -32,11 +32,27 @@ impl SimpleStorageEngine {
     }
 
     /// 从磁盘加载表数据
-    fn load_from_disk(&mut self) {
+    /*fn load_from_disk(&mut self) {
         let mut file = File::open(&self.file_path).unwrap_or_else(|_| File::create(&self.file_path).unwrap());
         let mut contents = String::new();
         file.read_to_string(&mut contents).expect("Failed to read data from disk");
         self.tables = serde_json::from_str(&contents).unwrap_or_else(|_| HashMap::new()); // 反序列化
+    }*/
+
+    // modified
+    fn load_from_disk(&mut self) {
+        let file_result = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&self.file_path);
+    
+        let mut file = file_result.expect("Failed to open or create data file");
+    
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).expect("Failed to read data from disk");
+    
+        self.tables = serde_json::from_str(&contents).unwrap_or_else(|_| HashMap::new());
     }
 
     /// 将数据保存到磁盘
