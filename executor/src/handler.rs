@@ -612,6 +612,7 @@ fn handle_query(
                 filter_rows_with_compound_conditions(&initial_rows, selection_expr, &table_name, storage_engine)?
             } else {
                 // Simple condition already handled by storage engine
+                // 相同分支，想办法合起来。
                 initial_rows
             }
         } else {
@@ -1557,6 +1558,7 @@ pub fn run_test_case_with_storage<T: StorageEngine>(
 // cfg是configuration，表示只在test模式下编译。
 #[cfg(test)]
 pub mod tests {
+    
     // 导入父模块中所有公开的项
     use super::*;
     use sqlparser::dialect::GenericDialect;

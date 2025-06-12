@@ -28,3 +28,5 @@
 
 # 忽略测试生成的临时文件
 /tests/output/
+
+target

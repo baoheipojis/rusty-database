@@ -63,7 +63,7 @@ cargo run
 ```
 
 ## 支持的 SQL 语句
-
+我们项目支持CREATE, DROP, INSERT, SELECT等基本的SQL语句。
 ### CREATE TABLE
 ```sql
 CREATE TABLE users (
@@ -111,16 +111,6 @@ cargo fmt
 cargo clippy
 ```
 
-## CI/CD
-
-项目使用 GitHub Actions 进行持续集成，每次推送代码时会自动：
-
-- 🔧 检查代码格式化
-- 🕵️ 运行 Clippy 代码检查
-- 🏗️ 构建项目
-- 🧪 运行所有测试
-- 🌍 在多个平台上测试（Ubuntu, Windows, macOS）
-
 ## 架构设计
 
 ### 模块化设计
@@ -139,6 +129,67 @@ pub trait StorageEngine {
     // ... 更多方法
 }
 ```
+### 执行引擎
+
+我们的执行引擎是数据库系统的核心组件，负责解析和执行 SQL 语句。执行引擎采用模块化设计，通过统一的接口与存储引擎交互。
+
+#### 核心功能
+
+- **SQL 语句解析**: 使用 `sqlparser-rs` 库将 SQL 字符串解析为抽象语法树（AST）
+- **语句执行**: 支持 CREATE TABLE、INSERT、SELECT、UPDATE、DELETE 等基本 SQL 操作
+- **查询处理**: 支持带条件的查询、表达式计算和复合条件查询
+- **错误处理**: 提供完整的错误信息和异常处理机制
+- **结果格式化**: 将查询结果格式化为表格形式输出
+
+#### 执行引擎接口
+
+```rust
+/// 执行 SQL 字符串并返回输出结果
+pub fn execute_sql_and_get_output<T: StorageEngine>(
+    input_sql: &str,
+    storage_engine: &mut T
+) -> Result<String, String>;
+
+/// 执行单个 SQL 语句
+pub fn execute_stmt(
+    statement: Statement,
+    storage_engine: &mut dyn StorageEngine,
+) -> Result<QueryResult, ExecutionError>;
+```
+
+#### 支持的语句类型
+
+| 语句类型 | 处理函数 | 说明 |
+|---------|---------|------|
+| `SELECT` | `handle_query_stmt` | 查询数据，支持条件过滤和表达式计算 |
+| `INSERT` | `handle_insert_stmt` | 插入数据，支持单行和多行插入 |
+| `CREATE TABLE` | `handle_create_table_stmt` | 创建表，支持约束定义 |
+| `DROP TABLE` | `handle_drop_table_stmt` | 删除表 |
+
+
+#### 查询结果类型
+
+```rust
+pub enum QueryResult {
+    Data(Vec<Row>),         // SELECT 查询返回的数据行
+    RowsAffected(u64),      // UPDATE/DELETE 影响的行数
+    Success,                // CREATE/DROP 等操作的成功标识
+}
+```
+
+#### 错误处理
+
+执行引擎定义了完整的错误类型体系：
+
+```rust
+pub enum ExecutionError {
+    StorageError(String),     // 存储引擎错误
+    SyntaxError,              // SQL 语法错误  
+    UnsupportedStatement,     // 不支持的语句类型
+    TableNotFound(String),    // 表不存在
+    ColumnNotFound(String),   // 列不存在
+}
+```
 
 ## 贡献指南
 
@@ -151,10 +202,6 @@ pub trait StorageEngine {
 ## 许可证
 
 此项目使用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
-
-## 作者
-
-- **[Your Name]** - *初始工作* - [Your GitHub](https://github.com/[YOUR_GITHUB_USERNAME])
 
 ## 致谢
 
