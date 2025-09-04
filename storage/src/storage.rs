@@ -99,7 +99,13 @@ impl StorageEngine for SimpleStorageEngine {
         if row.values.len() != table.schema.columns.len() {
             return Err("Error: Row values do not match table schema.".to_string());
         }
-        
+
+        // 类型检查
+        for (value, column) in row.values.iter().zip(&table.schema.columns) {
+            if !value.matches_type(&column.data_type) {
+                return Err(format!("Error: Value '{:?}' does not match column type '{}'.", value, column.data_type));
+            }
+        }
         // 插入新行
         table.rows.push(row);
         self.save_to_disk(); // 保存到磁盘
